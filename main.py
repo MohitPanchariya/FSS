@@ -1,10 +1,12 @@
 from fastapi import FastAPI, HTTPException, status, Form, UploadFile
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from typing import Annotated
 import hashlib
 import os
 import shutil
 import helpers
+import rdiff
 
 app = FastAPI()
 
@@ -80,3 +82,46 @@ def uploadFile(
         )
     }
 
+# End point to get the signature file for a particular file in a user-space
+@app.get("/api/v1/user/{user_email}/path/{file_path: path}")
+def getSigFile(user_email: str, file_path: str):
+    '''
+    This endpoint is used to get a signature file in a user space for the 
+    provided file.
+    The client can then use the signature file to compute a delta file and
+    send a request to the server to update the file.
+    '''
+    # check if user exists
+    if(not helpers.userExists(user_email)):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="User doesn't exist."
+        )
+    sanitisedPath = helpers.sanitiseFilepath(file_path)
+
+    basePath = os.path.split(sanitisedPath)[0]
+    filename = os.path.split(sanitisedPath)[1]
+    
+    userSpace = hashlib.sha256(user_email.encode()).hexdigest()
+
+    userSpacesPath = os.path.join(".", "user-spaces")
+    # check if the file exists
+    if(not os.path.exists(os.path.join(userSpacesPath, userSpace, sanitisedPath))):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="File with specified path not found"
+        )
+    
+    # create the signatures directory if it doesn't exist
+    print(os.path.join(userSpacesPath, userSpace, basePath, ".signatures"))
+    os.makedirs(os.path.join(userSpacesPath, userSpace, basePath, ".signatures"), exist_ok=True)
+
+    # create the signature file for the requested file and store it in the signatures directory
+    checksum = rdiff.signature.Checksum()
+    signature = rdiff.signature.Signature(checksum)
+    signature.createSignature(
+        basisFilePath=os.path.join(userSpacesPath, userSpace, sanitisedPath),
+        sigFilePath=os.path.join(userSpacesPath, userSpace, basePath, ".signatures", filename)
+    )
+
+    return FileResponse(os.path.join(userSpacesPath, userSpace, basePath, ".signatures", filename))
