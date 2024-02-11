@@ -2,11 +2,7 @@ from fastapi import FastAPI, HTTPException, status, Form, UploadFile
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from typing import Annotated
-import hashlib
-import os
-import shutil
-import helpers
-import rdiff
+import hashlib, os, shutil, helpers, rdiff, tempfile
 
 app = FastAPI()
 
@@ -124,4 +120,91 @@ def getSigFile(user_email: str, file_path: str):
         sigFilePath=os.path.join(userSpacesPath, userSpace, basePath, ".signatures", filename)
     )
 
-    return FileResponse(os.path.join(userSpacesPath, userSpace, basePath, ".signatures", filename))
+    return FileResponse(
+        os.path.join(userSpacesPath, userSpace, basePath, ".signatures", filename), 
+        filename=f"{filename}.sig",
+        media_type="application/octet-stream"
+    )
+
+# End point to push changes to a file in a user-space
+@app.patch("/api/v1/update-file")
+def patchFile(
+    user_email: Annotated[str, Form()],
+    file_path: Annotated[str, Form()],
+    delta_file: UploadFile
+):
+    '''
+    This endpoint is used to update a file in a user-space. The client needs
+    to provide a user email to identify the user space. Along with this,
+    the client also needs to send a delta file, representing the changes to be
+    made to the file.
+    The file to be updated is identified by the file_path, which is
+    relative path from base dir + filename.
+    '''
+    # check if user exists
+    if(not helpers.userExists(user_email)):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="User doesn't exist."
+        )
+    
+    sanitisedPath = helpers.sanitiseFilepath(file_path)
+
+    basePath = os.path.split(sanitisedPath)[0]
+    
+    userSpace = hashlib.sha256(user_email.encode()).hexdigest()
+
+    userSpacesPath = os.path.join(".", "user-spaces")
+    # check if the file exists
+    if(not os.path.exists(os.path.join(userSpacesPath, userSpace, sanitisedPath))):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="File with specified path not found"
+        )
+    
+    # Perform the patch operation
+    try:
+
+        # Due to a limitation in the rdiff package, it requires file paths and
+        # not file like objects, the delta_file needs to be saved
+        # temporarily on the server to perform the file patch operation.
+
+        # create a temporary delta file
+        tempDeltaFile = tempfile.NamedTemporaryFile(mode="wb", delete=False)
+        shutil.copyfileobj(delta_file.file, tempDeltaFile)
+        tempDeltaFile.close()
+
+        # create a temporary out file to store the updated file
+        tempOutFile = tempfile.NamedTemporaryFile(
+            mode="wb", delete=False,
+            dir=os.path.join(userSpacesPath, userSpace, basePath)
+        )
+
+        patcher = rdiff.patch.Patch()
+        patcher.patchFile(
+            tempDeltaFile.name,
+            os.path.join(userSpacesPath, userSpace, sanitisedPath),
+            tempOutFile.name
+        )   
+
+        tempOutFile.close()
+
+        # Atomically rename the temporary file to the actual filename
+        os.replace(tempOutFile.name, os.path.join(userSpacesPath, userSpace, sanitisedPath))
+    except Exception:
+        # remove the temp updated file
+        os.remove(tempOutFile.name)
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid delta file."
+        )
+    finally:
+        # remove the temp delta file
+        os.remove(tempDeltaFile.name)
+        
+    return {
+        "path_in_user_dir": os.path.relpath(
+            os.path.join(userSpacesPath, userSpace, sanitisedPath),
+            os.path.join(userSpacesPath, userSpace)
+        )
+    }
