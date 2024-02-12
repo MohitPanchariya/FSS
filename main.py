@@ -1,4 +1,5 @@
 from fastapi import FastAPI, HTTPException, status, Form, UploadFile
+from fastapi import BackgroundTasks
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from typing import Annotated
@@ -151,7 +152,7 @@ def patchFile(
     sanitisedPath = helpers.sanitiseFilepath(file_path)
 
     basePath = os.path.split(sanitisedPath)[0]
-    
+
     userSpace = hashlib.sha256(user_email.encode()).hexdigest()
 
     userSpacesPath = os.path.join(".", "user-spaces")
@@ -208,3 +209,92 @@ def patchFile(
             os.path.join(userSpacesPath, userSpace)
         )
     }
+
+
+def deleteTempDeltaFile(filepath):
+    '''
+    This function is used to delete the temporary delta file created when
+    the client makes a request to the /api/v1/pull-change route.
+    '''
+    os.remove(filepath)
+
+# Endpoint to pull changes for a file in a user-space
+@app.post("/api/v1/pull-change")
+def getDeltaFile(
+    user_email: Annotated[str, Form()],
+    file_path: Annotated[str, Form()],
+    sig_file: UploadFile,
+    backgroundTasks: BackgroundTasks
+):
+    '''
+    This endpoint is used to get a delta file for a file specified by the client.
+    The delta file is produced against the signature file provided by the client
+    and sent back to the client. The client can then use this delta file to patch
+    the file to be updated on the client machine. Thus, the server and client
+    now have the same version of the file.
+    '''
+    # check if user exists
+    if(not helpers.userExists(user_email)):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="User doesn't exist."
+        )
+    
+    sanitisedPath = helpers.sanitiseFilepath(file_path)
+
+    basePath = os.path.split(sanitisedPath)[0]
+    filename = os.path.split(sanitisedPath)[1]
+
+    userSpace = hashlib.sha256(user_email.encode()).hexdigest()
+
+    userSpacesPath = os.path.join(".", "user-spaces")
+    # check if the file exists
+    if(not os.path.exists(os.path.join(userSpacesPath, userSpace, sanitisedPath))):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="File with specified path not found"
+        )
+    
+    # Due to a limitation in the rdiff package (it requires file paths and
+    # not file like objects)the sig_file needs to be saved
+    # temporarily on the server to create the delta file
+
+    # create a temporary signature file
+    tempSigFile = tempfile.NamedTemporaryFile(mode="wb", delete=False)
+    shutil.copyfileobj(sig_file.file, tempSigFile)
+    tempSigFile.close()
+
+    # create a temporary file to store the delta file
+    tempDeltaFile = tempfile.NamedTemporaryFile(
+        mode="wb", delete=False,
+        dir=os.path.join(userSpacesPath, userSpace, basePath)
+    )
+
+    # Populate the delta file
+    try:
+        checksum = rdiff.signature.Checksum()
+        delta = rdiff.delta.Delta()
+        delta.createDeltaFile(
+            inFilePath=os.path.join(userSpacesPath, userSpace, sanitisedPath),
+            deltaFilePath=tempDeltaFile.name,
+            sigFielPath=tempSigFile.name,
+            blockSize=1024, # default block size used to create the sig file
+            checksum=checksum
+        )
+    except Exception:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid signature file."
+        )
+    finally:
+        # remove the temp signature file
+        os.remove(tempSigFile.name)
+        
+    # Background task to delete the temporary delta file produced
+    backgroundTasks.add_task(deleteTempDeltaFile, tempDeltaFile.name)  
+
+    return FileResponse(
+        os.path.join(userSpacesPath, userSpace, basePath, tempDeltaFile.name), 
+        filename=f"{filename}.delta",
+        media_type="application/octet-stream"
+    )
