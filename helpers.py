@@ -1,13 +1,13 @@
 import os
 import hashlib
+from globals import USERSPACES
 
 def userExists(userEmail) -> bool:
     # This hash will be the name of the user root dir
     hash = hashlib.sha256(userEmail.encode()).hexdigest()
     # Check if user dir already exists. This indicates the
     # user space is alread created
-    userSpaceDir = os.path.join(".", "user-spaces")
-    if(os.path.isdir(os.path.join(userSpaceDir, hash))):
+    if(os.path.isdir(os.path.join(USERSPACES, hash))):
         return True
     return False
 

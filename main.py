@@ -1,9 +1,10 @@
 from fastapi import FastAPI, HTTPException, status, Form, UploadFile
-from fastapi import BackgroundTasks
+from fastapi import BackgroundTasks, Depends, Request
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from typing import Annotated
 import hashlib, os, shutil, helpers, rdiff, tempfile
+from globals import USERSPACES
 
 app = FastAPI()
 
@@ -28,11 +29,10 @@ def createUser(user: User) -> User:
             detail="User already exists."
         )
     
-    userSpaceDir = os.path.join(".", "user-spaces")
     # User space/root user directory is named with a hash of the user's email
     hash = hashlib.sha256(user.email.encode()).hexdigest()
     # If the user space doesn't exist already, create one
-    os.makedirs(os.path.join(userSpaceDir, hash))
+    os.makedirs(os.path.join(USERSPACES, hash))
     return user
 
 # End point to upload a file to a user-space
@@ -53,7 +53,7 @@ def uploadFile(
     sanitisedFileName = helpers.sanitiseFilepath(file.filename)
 
     userSpace = hashlib.sha256(user_email.encode()).hexdigest()
-    pathInUserSpace = os.path.join(".", "user-spaces", userSpace, sanitisedPathFromBase)
+    pathInUserSpace = os.path.join(USERSPACES, userSpace, sanitisedPathFromBase)
     # create the directories inside the user space
     os.makedirs(pathInUserSpace, exist_ok=True)
 
@@ -75,7 +75,7 @@ def uploadFile(
     return {
         "path_in_user_dir": os.path.relpath(
             os.path.join(pathInUserSpace, sanitisedFileName),
-            os.path.join(".", "user-spaces", userSpace)
+            os.path.join(USERSPACES, userSpace)
         )
     }
 
@@ -101,28 +101,27 @@ def getSigFile(user_email: str, file_path: str):
     
     userSpace = hashlib.sha256(user_email.encode()).hexdigest()
 
-    userSpacesPath = os.path.join(".", "user-spaces")
     # check if the file exists
-    if(not os.path.exists(os.path.join(userSpacesPath, userSpace, sanitisedPath))):
+    if(not os.path.exists(os.path.join(USERSPACES, userSpace, sanitisedPath))):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="File with specified path not found"
         )
     
     # create the signatures directory if it doesn't exist
-    print(os.path.join(userSpacesPath, userSpace, basePath, ".signatures"))
-    os.makedirs(os.path.join(userSpacesPath, userSpace, basePath, ".signatures"), exist_ok=True)
+    print(os.path.join(USERSPACES, userSpace, basePath, ".signatures"))
+    os.makedirs(os.path.join(USERSPACES, userSpace, basePath, ".signatures"), exist_ok=True)
 
     # create the signature file for the requested file and store it in the signatures directory
     checksum = rdiff.signature.Checksum()
     signature = rdiff.signature.Signature(checksum)
     signature.createSignature(
-        basisFilePath=os.path.join(userSpacesPath, userSpace, sanitisedPath),
-        sigFilePath=os.path.join(userSpacesPath, userSpace, basePath, ".signatures", filename)
+        basisFilePath=os.path.join(USERSPACES, userSpace, sanitisedPath),
+        sigFilePath=os.path.join(USERSPACES, userSpace, basePath, ".signatures", filename)
     )
 
     return FileResponse(
-        os.path.join(userSpacesPath, userSpace, basePath, ".signatures", filename), 
+        os.path.join(USERSPACES, userSpace, basePath, ".signatures", filename), 
         filename=f"{filename}.sig",
         media_type="application/octet-stream"
     )
@@ -155,9 +154,8 @@ def patchFile(
 
     userSpace = hashlib.sha256(user_email.encode()).hexdigest()
 
-    userSpacesPath = os.path.join(".", "user-spaces")
     # check if the file exists
-    if(not os.path.exists(os.path.join(userSpacesPath, userSpace, sanitisedPath))):
+    if(not os.path.exists(os.path.join(USERSPACES, userSpace, sanitisedPath))):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="File with specified path not found"
@@ -178,20 +176,20 @@ def patchFile(
         # create a temporary out file to store the updated file
         tempOutFile = tempfile.NamedTemporaryFile(
             mode="wb", delete=False,
-            dir=os.path.join(userSpacesPath, userSpace, basePath)
+            dir=os.path.join(USERSPACES, userSpace, basePath)
         )
 
         patcher = rdiff.patch.Patch()
         patcher.patchFile(
             tempDeltaFile.name,
-            os.path.join(userSpacesPath, userSpace, sanitisedPath),
+            os.path.join(USERSPACES, userSpace, sanitisedPath),
             tempOutFile.name
         )   
 
         tempOutFile.close()
 
         # Atomically rename the temporary file to the actual filename
-        os.replace(tempOutFile.name, os.path.join(userSpacesPath, userSpace, sanitisedPath))
+        os.replace(tempOutFile.name, os.path.join(USERSPACES, userSpace, sanitisedPath))
     except Exception:
         # remove the temp updated file
         os.remove(tempOutFile.name)
@@ -205,8 +203,8 @@ def patchFile(
         
     return {
         "path_in_user_dir": os.path.relpath(
-            os.path.join(userSpacesPath, userSpace, sanitisedPath),
-            os.path.join(userSpacesPath, userSpace)
+            os.path.join(USERSPACES, userSpace, sanitisedPath),
+            os.path.join(USERSPACES, userSpace)
         )
     }
 
@@ -247,9 +245,8 @@ def getDeltaFile(
 
     userSpace = hashlib.sha256(user_email.encode()).hexdigest()
 
-    userSpacesPath = os.path.join(".", "user-spaces")
     # check if the file exists
-    if(not os.path.exists(os.path.join(userSpacesPath, userSpace, sanitisedPath))):
+    if(not os.path.exists(os.path.join(USERSPACES, userSpace, sanitisedPath))):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="File with specified path not found"
@@ -267,7 +264,7 @@ def getDeltaFile(
     # create a temporary file to store the delta file
     tempDeltaFile = tempfile.NamedTemporaryFile(
         mode="wb", delete=False,
-        dir=os.path.join(userSpacesPath, userSpace, basePath)
+        dir=os.path.join(USERSPACES, userSpace, basePath)
     )
 
     # Populate the delta file
@@ -275,7 +272,7 @@ def getDeltaFile(
         checksum = rdiff.signature.Checksum()
         delta = rdiff.delta.Delta()
         delta.createDeltaFile(
-            inFilePath=os.path.join(userSpacesPath, userSpace, sanitisedPath),
+            inFilePath=os.path.join(USERSPACES, userSpace, sanitisedPath),
             deltaFilePath=tempDeltaFile.name,
             sigFielPath=tempSigFile.name,
             blockSize=1024, # default block size used to create the sig file
@@ -294,7 +291,7 @@ def getDeltaFile(
     backgroundTasks.add_task(deleteTempDeltaFile, tempDeltaFile.name)  
 
     return FileResponse(
-        os.path.join(userSpacesPath, userSpace, basePath, tempDeltaFile.name), 
+        os.path.join(USERSPACES, userSpace, basePath, tempDeltaFile.name), 
         filename=f"{filename}.delta",
         media_type="application/octet-stream"
     )
