@@ -1,39 +1,207 @@
 from fastapi import FastAPI, HTTPException, status, Form, UploadFile
-from fastapi import BackgroundTasks, Depends, Request
+from fastapi import BackgroundTasks, Depends, Request, Response
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from typing import Annotated
 import hashlib, os, shutil, helpers, rdiff, tempfile
 from globals import USERSPACES
+import psycopg2
+from psycopg2.extras import DictCursor, register_uuid
+import bcrypt
+from contextlib import asynccontextmanager
+import uuid
+from itsdangerous import URLSafeSerializer, SignatureExpired, BadSignature
+import datetime
+from secrets import token_hex
+from dotenv import load_dotenv
 
-app = FastAPI()
+load_dotenv(dotenv_path="./env")
+dbParameters = {}
+register_uuid()
 
-class User(BaseModel):
+SECRET_KEY = token_hex()
+serializer = URLSafeSerializer(SECRET_KEY)
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    dbParameters["dbname"] = os.environ["DB_NAME"]
+    dbParameters["user"] = os.environ["DB_USER"]
+    dbParameters["password"] = os.environ["DB_PASSWORD"]
+    dbParameters["host"] = os.environ["DB_HOST"]
+    dbParameters["port"] = os.environ["DB_PORT"]
+    yield
+
+app = FastAPI(lifespan=lifespan)
+
+
+class UserLogin(BaseModel):
     email: str
+    password: str
 
+class UserRegister(BaseModel):
+    email: str
+    password: str
+    username: str
 
-# End point to create a new user
-@app.post("/api/v1/users", status_code=status.HTTP_201_CREATED)
-def createUser(user: User) -> User:
+def getDbConnection():
+    return psycopg2.connect(**dbParameters, cursor_factory=DictCursor)
+
+def extractCookie(signedCookie):
     '''
-    This endpoint creates a new user. Essentially,
-    this involves creating a user-space/user-root
-    directory.
-    The user-root directory is named using a 
-    SHA-256 hash of the email associated with the user.
+    Returns the cookie if its valid. Else returns None.
     '''
-    # Check if user already exists.
-    if(helpers.userExists(user.email)):
+    try:
+        cookie = serializer.loads(signedCookie)
+        return cookie
+    except Exception as e:
+        print(e)
+        return False
+
+def loginRequired(request: Request):
+    signedsessionId = request.cookies.get("session-id")
+    if not signedsessionId:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="login required."
+        )
+    try:
+        sessionId = serializer.loads(signedsessionId)
+        # session id verified
+        return sessionId
+    except SignatureExpired:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="session expired. Login again."
+        )
+    except BadSignature:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid session-id"
+        )
+
+@app.post("/api/v1/login")
+def login(userLogin: UserLogin, response: Response, request: Request):
+    conn = getDbConnection()
+    cur = conn.cursor()
+    # Check if user exists
+    query = "SELECT id, email, password from app_user where email = %s"
+    cur.execute(query, (userLogin.email,))
+
+    userData = cur.fetchone()
+    # user doesn't exist
+    if not userData:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="user not found"
+        )
+    else:
+        sessionCookie = request.cookies.get("session-id")
+        print(f"received cookie: {sessionCookie}")
+        sessionId = extractCookie(sessionCookie)
+        print(sessionId)
+        # If the session cookie is valid, check if the user already has an
+        # active session against this sessionId
+        if sessionId:
+            query = "SELECT id,expires_at FROM user_session WHERE id = %s"
+            cur.execute(query, (sessionId,))
+
+            session = cur.fetchone()
+            if session:
+                # session has expired
+                if session["expires_at"] < datetime.datetime.now():
+                    query = "DELETE FROM user_session WHERE id = %s"
+                    cur.execute(query, (sessionId,))
+                    conn.commit()
+                # session is still valid
+                else:
+                    print("user already in session")
+                    return {
+                    "id": str(userData["id"]),
+                    "email": userData["email"]
+                }
+
+            
+        # validate the password
+        passwordIsValid = bcrypt.checkpw(
+            userLogin.password.encode(),
+            userData["password"]
+        )
+        if not passwordIsValid:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="email or password is incorrect"
+            )
+        # create a session for the user
+        sessionId = uuid.uuid4()
+        signedSessionId = serializer.dumps(str(sessionId))
+        print(f"signed session cookie = {signedSessionId}")
+        createdAt = datetime.datetime.now()
+        expiresAt = createdAt + datetime.timedelta(hours=1)
+        print(expiresAt)
+        # insert session into database
+        query = "INSERT INTO user_session VALUES(%s, %s, %s, %s)"
+        cur.execute(
+            query,
+            (sessionId, userData["id"], createdAt, expiresAt)
+        )
+
+        cur.close()
+        conn.commit()
+        conn.close()
+
+        response.set_cookie(
+            key="session-id",
+            value=signedSessionId,
+            max_age=3600,
+            expires=expiresAt.replace(tzinfo=datetime.timezone.utc).timestamp()
+        )
+
+        return {
+            "id": str(userData["id"]),
+            "email": userData["email"]
+        }
+    
+
+@app.post("/api/v1/register")
+def register(userRegister: UserRegister, response: Response):
+    conn = getDbConnection()
+    cur = conn.cursor()
+    # Check if user is already registered
+    query = "SELECT email from app_user where email = %s"
+    cur.execute(query, (userRegister.email,))
+
+    userExists = cur.fetchone()
+
+    if userExists:
+        cur.close()
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail="User already exists."
+            detail="user already exists"
         )
-    
-    # User space/root user directory is named with a hash of the user's email
-    hash = hashlib.sha256(user.email.encode()).hexdigest()
-    # If the user space doesn't exist already, create one
-    os.makedirs(os.path.join(USERSPACES, hash))
-    return user
+    # create the user
+    else:
+        id = uuid.uuid4()
+        hashedPassword = bcrypt.hashpw(userRegister.password, bcrypt.gensalt())
+        print(hashedPassword)
+        query = "INSERT INTO app_user VALUES (%s, %s, %s, %s)"
+        cur.execute(
+            query,
+            (id, userRegister.username, userRegister.email, hashedPassword)
+        )
+        cur.close()
+        conn.commit()
+        conn.close()
+        response.status_code = status.HTTP_201_CREATED
+
+        # User space/root user directory is named with a hash of the user's email
+        hash = hashlib.sha256(userRegister.email.encode()).hexdigest()
+        # If the user space doesn't exist already, create one
+        os.makedirs(os.path.join(USERSPACES, hash))
+        return {
+            "id": id,
+            "username": userRegister.username,
+            "email": userRegister.email
+        }
 
 # End point to upload a file to a user-space
 @app.post("/api/v1/upload-file", status_code=status.HTTP_201_CREATED)
