@@ -57,6 +57,16 @@ def extractCookie(signedCookie):
         print(e)
         return False
 
+def deleteExpiredSession(sessionId):
+    conn = getDbConnection()
+    cur = conn.cursor()
+
+    query = "DELETE FROM user_session WHERE id = %s"
+    cur.execute(query, (sessionId,))
+    conn.commit()
+    cur.close()
+    conn.close()
+
 def loginRequired(request: Request):
     signedsessionId = request.cookies.get("session-id")
     if not signedsessionId:
@@ -66,8 +76,28 @@ def loginRequired(request: Request):
         )
     try:
         sessionId = serializer.loads(signedsessionId)
-        # session id verified
-        return sessionId
+        conn = getDbConnection()
+        cur = conn.cursor()
+
+        query = "SELECT expires_at FROM user_session WHERE id = %s"
+        cur.execute(query, (sessionId,))
+
+        result = cur.fetchone()
+
+        if result:
+            # session has expired
+            if result["expires_at"] < datetime.datetime.now():
+                deleteExpiredSession(sessionId)
+                cur.close()
+                conn.close()
+            # session is still valid
+            else:
+                return sessionId
+        else:
+            raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="session expired. Login again."
+        )
     except SignatureExpired:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -109,9 +139,7 @@ def login(userLogin: UserLogin, response: Response, request: Request):
             if session:
                 # session has expired
                 if session["expires_at"] < datetime.datetime.now():
-                    query = "DELETE FROM user_session WHERE id = %s"
-                    cur.execute(query, (sessionId,))
-                    conn.commit()
+                    deleteExpiredSession(sessionId)
                 # session is still valid
                 else:
                     print("user already in session")
@@ -180,25 +208,25 @@ def register(userRegister: UserRegister, response: Response):
         )
     # create the user
     else:
-        id = uuid.uuid4()
+        userId = uuid.uuid4()
         hashedPassword = bcrypt.hashpw(userRegister.password, bcrypt.gensalt())
         print(hashedPassword)
         query = "INSERT INTO app_user VALUES (%s, %s, %s, %s)"
         cur.execute(
             query,
-            (id, userRegister.username, userRegister.email, hashedPassword)
+            (userId, userRegister.username, userRegister.email, hashedPassword)
         )
         cur.close()
         conn.commit()
         conn.close()
         response.status_code = status.HTTP_201_CREATED
 
-        # User space/root user directory is named with a hash of the user's email
-        hash = hashlib.sha256(userRegister.email.encode()).hexdigest()
+        # User space/root user directory is named with a hash of the user's id
+        hash = hashlib.sha256(userId.hex.encode()).hexdigest()
         # If the user space doesn't exist already, create one
         os.makedirs(os.path.join(USERSPACES, hash))
         return {
-            "id": id,
+            "id": userId.hex,
             "username": userRegister.username,
             "email": userRegister.email
         }
@@ -206,21 +234,27 @@ def register(userRegister: UserRegister, response: Response):
 # End point to upload a file to a user-space
 @app.post("/api/v1/upload-file", status_code=status.HTTP_201_CREATED)
 def uploadFile(
-    user_email: Annotated[str, Form()],
     path_from_base: Annotated[str, Form()],
-    file: UploadFile
+    file: UploadFile,
+    sessionId: Annotated[str | None, Depends(loginRequired)]
 ):
-    # check if the user exists. If not, return an error
-    if(not helpers.userExists(user_email)):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="User doesn't exist. User must be created first."
-        )
+    conn = getDbConnection()
+    cur = conn.cursor()
+
+    query = "SELECT user_id FROM user_session WHERE id = %s"
+    cur.execute(query, (sessionId,))
+
+    result = cur.fetchone()
+    userId = result["user_id"]
+
+    cur.close()
+    conn.close()
+
     # sanitise the client provided path
     sanitisedPathFromBase = helpers.sanitiseFilepath(path_from_base)
     sanitisedFileName = helpers.sanitiseFilepath(file.filename)
 
-    userSpace = hashlib.sha256(user_email.encode()).hexdigest()
+    userSpace = hashlib.sha256(userId.hex.encode()).hexdigest()
     pathInUserSpace = os.path.join(USERSPACES, userSpace, sanitisedPathFromBase)
     # create the directories inside the user space
     os.makedirs(pathInUserSpace, exist_ok=True)
@@ -248,26 +282,33 @@ def uploadFile(
     }
 
 # End point to get the signature file for a particular file in a user-space
-@app.get("/api/v1/user/{user_email}/path/{file_path: path}")
-def getSigFile(user_email: str, file_path: str):
+@app.get("/api/v1/path/{file_path: path}")
+def getSigFile(file_path: str, sessionId: Annotated[str | None, Depends(loginRequired)]):
     '''
     This endpoint is used to get a signature file in a user space for the 
     provided file.
     The client can then use the signature file to compute a delta file and
     send a request to the server to update the file.
     '''
-    # check if user exists
-    if(not helpers.userExists(user_email)):
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="User doesn't exist."
-        )
+    
+    conn = getDbConnection()
+    cur = conn.cursor()
+
+    query = "SELECT user_id FROM user_session WHERE id = %s"
+    cur.execute(query, (sessionId,))
+
+    result = cur.fetchone()
+    userId = result["user_id"]
+
+    cur.close()
+    conn.close()
+
     sanitisedPath = helpers.sanitiseFilepath(file_path)
 
     basePath = os.path.split(sanitisedPath)[0]
     filename = os.path.split(sanitisedPath)[1]
     
-    userSpace = hashlib.sha256(user_email.encode()).hexdigest()
+    userSpace = hashlib.sha256(userId.hex.encode()).hexdigest()
 
     # check if the file exists
     if(not os.path.exists(os.path.join(USERSPACES, userSpace, sanitisedPath))):
@@ -297,9 +338,9 @@ def getSigFile(user_email: str, file_path: str):
 # End point to push changes to a file in a user-space
 @app.patch("/api/v1/update-file")
 def patchFile(
-    user_email: Annotated[str, Form()],
     file_path: Annotated[str, Form()],
-    delta_file: UploadFile
+    delta_file: UploadFile,
+    sessionId: Annotated[str | None, Depends(loginRequired)]
 ):
     '''
     This endpoint is used to update a file in a user-space. The client needs
@@ -309,18 +350,23 @@ def patchFile(
     The file to be updated is identified by the file_path, which is
     relative path from base dir + filename.
     '''
-    # check if user exists
-    if(not helpers.userExists(user_email)):
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="User doesn't exist."
-        )
+    conn = getDbConnection()
+    cur = conn.cursor()
+
+    query = "SELECT user_id FROM user_session WHERE id = %s"
+    cur.execute(query, (sessionId,))
+
+    result = cur.fetchone()
+    userId = result["user_id"]
+
+    cur.close()
+    conn.close()
     
     sanitisedPath = helpers.sanitiseFilepath(file_path)
 
     basePath = os.path.split(sanitisedPath)[0]
 
-    userSpace = hashlib.sha256(user_email.encode()).hexdigest()
+    userSpace = hashlib.sha256(userId.hex.encode()).hexdigest()
 
     # check if the file exists
     if(not os.path.exists(os.path.join(USERSPACES, userSpace, sanitisedPath))):
@@ -387,10 +433,10 @@ def deleteTempDeltaFile(filepath):
 # Endpoint to pull changes for a file in a user-space
 @app.post("/api/v1/pull-change")
 def getDeltaFile(
-    user_email: Annotated[str, Form()],
     file_path: Annotated[str, Form()],
     sig_file: UploadFile,
-    backgroundTasks: BackgroundTasks
+    backgroundTasks: BackgroundTasks,
+    sessionId: Annotated[str | None, Depends(loginRequired)]
 ):
     '''
     This endpoint is used to get a delta file for a file specified by the client.
@@ -399,19 +445,24 @@ def getDeltaFile(
     the file to be updated on the client machine. Thus, the server and client
     now have the same version of the file.
     '''
-    # check if user exists
-    if(not helpers.userExists(user_email)):
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="User doesn't exist."
-        )
+    conn = getDbConnection()
+    cur = conn.cursor()
+
+    query = "SELECT user_id FROM user_session WHERE id = %s"
+    cur.execute(query, (sessionId,))
+
+    result = cur.fetchone()
+    userId = result["user_id"]
+
+    cur.close()
+    conn.close()
     
     sanitisedPath = helpers.sanitiseFilepath(file_path)
 
     basePath = os.path.split(sanitisedPath)[0]
     filename = os.path.split(sanitisedPath)[1]
 
-    userSpace = hashlib.sha256(user_email.encode()).hexdigest()
+    userSpace = hashlib.sha256(userId.hex.encode()).hexdigest()
 
     # check if the file exists
     if(not os.path.exists(os.path.join(USERSPACES, userSpace, sanitisedPath))):
