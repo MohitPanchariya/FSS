@@ -1,22 +1,12 @@
 import os
-import hashlib
-from globals import USERSPACES
 
-def userExists(userEmail) -> bool:
-    # This hash will be the name of the user root dir
-    hash = hashlib.sha256(userEmail.encode()).hexdigest()
-    # Check if user dir already exists. This indicates the
-    # user space is alread created
-    if(os.path.isdir(os.path.join(USERSPACES, hash))):
-        return True
-    return False
 
-def sanitiseFilepath(filePath: str) -> str:
-    '''
+def sanitise_file_path(file_path: str) -> str:
+    """
     This function takes in a file path and sanitises it to get rid of traversals
-    to parent directories, and redundant separators. It finnaly returns back a 
+    to parent directories, and redundant separators. It finally returns back a
     path which doesn't include file traversals and is it safe to use.
-    '''
+    """
     # os.path.normpath returns a normalised path, collapsing relative paths
     # and getting rid of redundant separators.
     # E.g: file_path = "a/b/c/../test.txt" is equivalent to just a/b/test.txt.
@@ -28,5 +18,4 @@ def sanitiseFilepath(filePath: str) -> str:
     # the start of the normpath.
     # E.g filePath = ../../../test1/test2/../test.txt will
     # resolve to test1/test.txt.
-    print(os.path.relpath(os.path.normpath(os.path.join("/", filePath)), "/"))
-    return os.path.relpath(os.path.normpath(os.path.join("/", filePath)), "/")
+    return os.path.relpath(os.path.normpath(os.path.join("/", file_path)), "/")
