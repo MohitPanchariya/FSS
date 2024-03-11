@@ -1,35 +1,54 @@
+from itsdangerous import URLSafeSerializer, SignatureExpired, BadSignature
 from fastapi import FastAPI, HTTPException, status, Form, UploadFile
 from fastapi import BackgroundTasks, Depends, Request, Response
-from fastapi.responses import FileResponse
-from pydantic import BaseModel
-from typing import Annotated
-import hashlib, os, shutil, helpers, rdiff, tempfile
-from globals import USERSPACES
-import psycopg2
 from psycopg2.extras import DictCursor, register_uuid
-import bcrypt
+from fastapi.responses import FileResponse
 from contextlib import asynccontextmanager
-import uuid
-from itsdangerous import URLSafeSerializer, SignatureExpired, BadSignature
-import datetime
-from secrets import token_hex
+from globals import USERSPACES
+from pydantic import BaseModel
 from dotenv import load_dotenv
+from secrets import token_hex
+from typing import Annotated
+from typing import Optional
+import hashlib
+import os
+import shutil
+import helpers
+import rdiff
+import tempfile
+import psycopg2
+import bcrypt
+import uuid
+import datetime
+import asyncpg
 
-load_dotenv(dotenv_path="./env")
 dbParameters = {}
 register_uuid()
 
 SECRET_KEY = token_hex()
 serializer = URLSafeSerializer(SECRET_KEY)
 
+db_connection_pool = None
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    dbParameters["dbname"] = os.environ["DB_NAME"]
+    global db_connection_pool
+    global dbParameters
+    load_dotenv(dotenv_path=".env")
+    dbParameters["database"] = os.environ["DB_NAME"]
     dbParameters["user"] = os.environ["DB_USER"]
     dbParameters["password"] = os.environ["DB_PASSWORD"]
     dbParameters["host"] = os.environ["DB_HOST"]
     dbParameters["port"] = os.environ["DB_PORT"]
+
+    # create the connection pool on startup
+    db_connection_pool = await asyncpg.create_pool(**dbParameters, min_size=1)
+
     yield
+    # close the connections on application shutdown
+    await db_connection_pool.close()
+
 
 app = FastAPI(lifespan=lifespan)
 
@@ -38,66 +57,87 @@ class UserLogin(BaseModel):
     email: str
     password: str
 
+
 class UserRegister(BaseModel):
     email: str
     password: str
     username: str
 
+
+class User:
+    """
+    User model for a user in the database.
+    """
+
+    def __init__(self, user_id: str, username: str, email: str, password: str):
+        self.user_id = user_id
+        self.username = username
+        self.email = email
+        self.password = password
+
+
 def getDbConnection():
     return psycopg2.connect(**dbParameters, cursor_factory=DictCursor)
 
-def extractCookie(signedCookie):
-    '''
-    Returns the cookie if its valid. Else returns None.
-    '''
+
+def extract_cookie(signed_cookie) -> Optional[str]:
+    """
+    Returns the cookie if it's valid. Else returns None.
+    """
     try:
-        cookie = serializer.loads(signedCookie)
+        cookie = serializer.loads(signed_cookie)
         return cookie
     except Exception as e:
-        print(e)
-        return False
+        return None
 
-def deleteExpiredSession(sessionId):
-    conn = getDbConnection()
-    cur = conn.cursor()
 
-    query = "DELETE FROM user_session WHERE id = %s"
-    cur.execute(query, (sessionId,))
-    conn.commit()
-    cur.close()
-    conn.close()
+async def delete_expired_session(session_id):
+    """
+    Deletes the session with the given session_id from
+    the database.
+    """
+    async with db_connection_pool.acquire() as connection:
+        query = "DELETE FROM user_session WHERE id = $1"
+        await connection.execute(query, session_id)
 
-def loginRequired(request: Request):
-    signedsessionId = request.cookies.get("session-id")
-    if not signedsessionId:
+
+async def login_required(request: Request):
+    """
+    This function is used to check if a user is logged in
+    by inspecting the user's cookie.
+    If the request doesn't contain a cookie, HTTP 401 Unauthorized
+    response is sent back to the client.
+    If the request contains a cookie, but if the session has expired,
+    HTTP 401 Unauthorized response is sent.
+    If the cookie has been tampered with, there by invalidating the
+    signature on the cookie, an HTTP 400 Bad request response is sent.
+    """
+    signed_session_id = request.cookies.get("session-id")
+    if not signed_session_id:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="login required."
         )
     try:
-        sessionId = serializer.loads(signedsessionId)
-        conn = getDbConnection()
-        cur = conn.cursor()
-
-        query = "SELECT expires_at FROM user_session WHERE id = %s"
-        cur.execute(query, (sessionId,))
-
-        result = cur.fetchone()
+        session_id = serializer.loads(signed_session_id)
+        async with db_connection_pool.acquire() as connection:
+            async with connection.transaction():
+                query = "SELECT * FROM user_session WHERE id = $1"
+                cur = await connection.cursor(query, session_id)
+                result = await cur.fetchrow()
 
         if result:
             # session has expired
             if result["expires_at"] < datetime.datetime.now():
-                deleteExpiredSession(sessionId)
-                cur.close()
-                conn.close()
+                await delete_expired_session(session_id)
             # session is still valid
             else:
-                return sessionId
+                return session_id
         else:
             raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="session expired. Login again."
-        )
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="session expired. Login again."
+            )
     except SignatureExpired:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -109,86 +149,117 @@ def loginRequired(request: Request):
             detail="Invalid session-id"
         )
 
-@app.post("/api/v1/login")
-def login(userLogin: UserLogin, response: Response, request: Request):
-    conn = getDbConnection()
-    cur = conn.cursor()
-    # Check if user exists
-    query = "SELECT id, email, password from app_user where email = %s"
-    cur.execute(query, (userLogin.email,))
 
-    userData = cur.fetchone()
+async def get_user(user_email: str) -> Optional[User]:
+    """
+    Returns a User object if the user exists.
+    Else returns None.
+    """
+    async with db_connection_pool.acquire() as connection:
+        async with connection.transaction():
+            query = "SELECT * from app_user where email = $1"
+            cur = await connection.cursor(query, user_email)
+            user_data = await cur.fetchrow()
+            if not user_data:
+                return None
+            return User(
+                user_id=user_data["id"],
+                email=user_data["email"],
+                username=user_data["username"],
+                password=user_data["password"]
+            )
+
+
+async def is_session_active(session_id: str) -> bool:
+    """
+    Returns True if the session is active and False otherwise.
+    Deletes the session entry from the database if the session
+    has expired.
+    """
+    async with db_connection_pool.acquire() as connection:
+        async with connection.transaction():
+            query = "SELECT expires_at FROM user_session WHERE id = $1"
+            cur = await connection.cursor(query, session_id)
+            session_data = await cur.fetchrow()
+            if session_data:
+                # session has expired
+                if session_data["expires_at"] < datetime:
+                    await delete_expired_session(session_id)
+                    return False
+                # session is still active
+                else:
+                    return True
+
+
+async def create_session(
+        user_id: str,
+        session_id: str,
+        created_at: datetime.datetime,
+        expires_at: datetime.datetime
+):
+    """
+    Inserts a session into the database.
+    """
+    async with db_connection_pool.acquire() as connection:
+        query = "INSERT INTO user_session VALUES($1, $2, $3, $4)"
+        await connection.execute(
+            query, session_id, user_id, created_at, expires_at
+        )
+
+
+@app.post("/api/v1/login")
+async def login(user_login: UserLogin, response: Response, request: Request):
+    user = await get_user(user_login.email)
+
     # user doesn't exist
-    if not userData:
+    if not user:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="user not found"
         )
     else:
-        sessionCookie = request.cookies.get("session-id")
-        print(f"received cookie: {sessionCookie}")
-        sessionId = extractCookie(sessionCookie)
-        print(sessionId)
+        session_cookie = request.cookies.get("session-id")
+        session_id = extract_cookie(session_cookie)
         # If the session cookie is valid, check if the user already has an
-        # active session against this sessionId
-        if sessionId:
-            query = "SELECT id,expires_at FROM user_session WHERE id = %s"
-            cur.execute(query, (sessionId,))
-
-            session = cur.fetchone()
-            if session:
-                # session has expired
-                if session["expires_at"] < datetime.datetime.now():
-                    deleteExpiredSession(sessionId)
-                # session is still valid
-                else:
-                    print("user already in session")
-                    return {
-                    "id": str(userData["id"]),
-                    "email": userData["email"]
+        # active session against this session_id
+        if session_id:
+            session_active = await is_session_active(session_id)
+            if session_active:
+                return {
+                    "id": str(user.user_id),
+                    "email": user.email
                 }
 
-            
         # validate the password
-        passwordIsValid = bcrypt.checkpw(
-            userLogin.password.encode(),
-            userData["password"]
+        password_valid = bcrypt.checkpw(
+            user_login.password.encode(),
+            user.password.encode()
         )
-        if not passwordIsValid:
+        if not password_valid:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="email or password is incorrect"
             )
         # create a session for the user
-        sessionId = uuid.uuid4()
-        signedSessionId = serializer.dumps(str(sessionId))
-        print(f"signed session cookie = {signedSessionId}")
-        createdAt = datetime.datetime.now()
-        expiresAt = createdAt + datetime.timedelta(hours=1)
-        print(expiresAt)
+        session_id = uuid.uuid4()
+        signed_session_id = serializer.dumps(str(session_id))
+        created_at = datetime.datetime.now()
+        expires_at = created_at + datetime.timedelta(hours=1)
         # insert session into database
-        query = "INSERT INTO user_session VALUES(%s, %s, %s, %s)"
-        cur.execute(
-            query,
-            (sessionId, userData["id"], createdAt, expiresAt)
-        )
-
-        cur.close()
-        conn.commit()
-        conn.close()
+        await create_session(user.user_id, session_id.hex, created_at, expires_at)
 
         response.set_cookie(
             key="session-id",
-            value=signedSessionId,
+            value=signed_session_id,
             max_age=3600,
-            expires=expiresAt.replace(tzinfo=datetime.timezone.utc).timestamp()
+            expires=expires_at.replace(tzinfo=datetime.timezone.utc).timestamp()
         )
 
         return {
-            "id": str(userData["id"]),
-            "email": userData["email"]
+            "id": str(user.user_id),
+            "email": user.email
         }
-    
+
 
 @app.post("/api/v1/register")
 def register(userRegister: UserRegister, response: Response):
@@ -231,13 +302,23 @@ def register(userRegister: UserRegister, response: Response):
             "email": userRegister.email
         }
 
+
 # End point to upload a file to a user-space
 @app.post("/api/v1/upload-file", status_code=status.HTTP_201_CREATED)
-def uploadFile(
-    path_from_base: Annotated[str, Form()],
-    file: UploadFile,
-    sessionId: Annotated[str | None, Depends(loginRequired)]
+async def upload_file(
+        path_from_base: Annotated[str, Form()],
+        file: UploadFile,
+        sessionId: Annotated[str | None, Depends(login_required)]
 ):
+    user_id = None
+    async with db_connection_pool.acquire() as connection:
+        async with connection.transaction():
+            query = "SELECT user_id FROM user_session WHERE id = $1"
+            cur = await connection.cursor(query, (sessionId))
+            result = cur.fetchrow()
+            print(result)
+            userId = result["user_id"]
+
     conn = getDbConnection()
     cur = conn.cursor()
 
@@ -262,12 +343,12 @@ def uploadFile(
     # check if user provided path from base and file name correspond to a directory
     # inside the user space. If it does, the user will have to either delete the
     # directory or use a different file name to store the file.
-    if(os.path.isdir(os.path.join(pathInUserSpace, sanitisedFileName))):
+    if (os.path.isdir(os.path.join(pathInUserSpace, sanitisedFileName))):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Directory with the same name as the file exists in the"\
-                    " provided file path. Either the directory must be deleted"\
-                    " or the file must be renamed."
+            detail="Directory with the same name as the file exists in the" \
+                   " provided file path. Either the directory must be deleted" \
+                   " or the file must be renamed."
         )
 
     # create the file inside the user space
@@ -281,16 +362,17 @@ def uploadFile(
         )
     }
 
+
 # End point to get the signature file for a particular file in a user-space
 @app.get("/api/v1/path/{file_path: path}")
-def getSigFile(file_path: str, sessionId: Annotated[str | None, Depends(loginRequired)]):
+def getSigFile(file_path: str, sessionId: Annotated[str | None, Depends(login_required)]):
     '''
     This endpoint is used to get a signature file in a user space for the 
     provided file.
     The client can then use the signature file to compute a delta file and
     send a request to the server to update the file.
     '''
-    
+
     conn = getDbConnection()
     cur = conn.cursor()
 
@@ -307,16 +389,16 @@ def getSigFile(file_path: str, sessionId: Annotated[str | None, Depends(loginReq
 
     basePath = os.path.split(sanitisedPath)[0]
     filename = os.path.split(sanitisedPath)[1]
-    
+
     userSpace = hashlib.sha256(userId.hex.encode()).hexdigest()
 
     # check if the file exists
-    if(not os.path.exists(os.path.join(USERSPACES, userSpace, sanitisedPath))):
+    if (not os.path.exists(os.path.join(USERSPACES, userSpace, sanitisedPath))):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="File with specified path not found"
         )
-    
+
     # create the signatures directory if it doesn't exist
     print(os.path.join(USERSPACES, userSpace, basePath, ".signatures"))
     os.makedirs(os.path.join(USERSPACES, userSpace, basePath, ".signatures"), exist_ok=True)
@@ -330,17 +412,18 @@ def getSigFile(file_path: str, sessionId: Annotated[str | None, Depends(loginReq
     )
 
     return FileResponse(
-        os.path.join(USERSPACES, userSpace, basePath, ".signatures", filename), 
+        os.path.join(USERSPACES, userSpace, basePath, ".signatures", filename),
         filename=f"{filename}.sig",
         media_type="application/octet-stream"
     )
 
+
 # End point to push changes to a file in a user-space
 @app.patch("/api/v1/update-file")
 def patchFile(
-    file_path: Annotated[str, Form()],
-    delta_file: UploadFile,
-    sessionId: Annotated[str | None, Depends(loginRequired)]
+        file_path: Annotated[str, Form()],
+        delta_file: UploadFile,
+        sessionId: Annotated[str | None, Depends(login_required)]
 ):
     '''
     This endpoint is used to update a file in a user-space. The client needs
@@ -361,7 +444,7 @@ def patchFile(
 
     cur.close()
     conn.close()
-    
+
     sanitisedPath = helpers.sanitiseFilepath(file_path)
 
     basePath = os.path.split(sanitisedPath)[0]
@@ -369,12 +452,12 @@ def patchFile(
     userSpace = hashlib.sha256(userId.hex.encode()).hexdigest()
 
     # check if the file exists
-    if(not os.path.exists(os.path.join(USERSPACES, userSpace, sanitisedPath))):
+    if (not os.path.exists(os.path.join(USERSPACES, userSpace, sanitisedPath))):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="File with specified path not found"
         )
-    
+
     # Perform the patch operation
     try:
 
@@ -398,7 +481,7 @@ def patchFile(
             tempDeltaFile.name,
             os.path.join(USERSPACES, userSpace, sanitisedPath),
             tempOutFile.name
-        )   
+        )
 
         tempOutFile.close()
 
@@ -414,7 +497,7 @@ def patchFile(
     finally:
         # remove the temp delta file
         os.remove(tempDeltaFile.name)
-        
+
     return {
         "path_in_user_dir": os.path.relpath(
             os.path.join(USERSPACES, userSpace, sanitisedPath),
@@ -430,13 +513,14 @@ def deleteTempDeltaFile(filepath):
     '''
     os.remove(filepath)
 
+
 # Endpoint to pull changes for a file in a user-space
 @app.post("/api/v1/pull-change")
 def getDeltaFile(
-    file_path: Annotated[str, Form()],
-    sig_file: UploadFile,
-    backgroundTasks: BackgroundTasks,
-    sessionId: Annotated[str | None, Depends(loginRequired)]
+        file_path: Annotated[str, Form()],
+        sig_file: UploadFile,
+        backgroundTasks: BackgroundTasks,
+        sessionId: Annotated[str | None, Depends(login_required)]
 ):
     '''
     This endpoint is used to get a delta file for a file specified by the client.
@@ -456,7 +540,7 @@ def getDeltaFile(
 
     cur.close()
     conn.close()
-    
+
     sanitisedPath = helpers.sanitiseFilepath(file_path)
 
     basePath = os.path.split(sanitisedPath)[0]
@@ -465,12 +549,12 @@ def getDeltaFile(
     userSpace = hashlib.sha256(userId.hex.encode()).hexdigest()
 
     # check if the file exists
-    if(not os.path.exists(os.path.join(USERSPACES, userSpace, sanitisedPath))):
+    if (not os.path.exists(os.path.join(USERSPACES, userSpace, sanitisedPath))):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="File with specified path not found"
         )
-    
+
     # Due to a limitation in the rdiff package (it requires file paths and
     # not file like objects)the sig_file needs to be saved
     # temporarily on the server to create the delta file
@@ -494,7 +578,7 @@ def getDeltaFile(
             inFilePath=os.path.join(USERSPACES, userSpace, sanitisedPath),
             deltaFilePath=tempDeltaFile.name,
             sigFielPath=tempSigFile.name,
-            blockSize=1024, # default block size used to create the sig file
+            blockSize=1024,  # default block size used to create the sig file
             checksum=checksum
         )
     except Exception:
@@ -505,12 +589,12 @@ def getDeltaFile(
     finally:
         # remove the temp signature file
         os.remove(tempSigFile.name)
-        
+
     # Background task to delete the temporary delta file produced
-    backgroundTasks.add_task(deleteTempDeltaFile, tempDeltaFile.name)  
+    backgroundTasks.add_task(deleteTempDeltaFile, tempDeltaFile.name)
 
     return FileResponse(
-        os.path.join(USERSPACES, userSpace, basePath, tempDeltaFile.name), 
+        os.path.join(USERSPACES, userSpace, basePath, tempDeltaFile.name),
         filename=f"{filename}.delta",
         media_type="application/octet-stream"
     )
