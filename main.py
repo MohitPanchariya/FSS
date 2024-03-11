@@ -21,6 +21,7 @@ import bcrypt
 import uuid
 import datetime
 import asyncpg
+import aiofiles.os as aos
 
 dbParameters = {}
 register_uuid()
@@ -207,6 +208,28 @@ async def create_session(
         )
 
 
+async def create_user(email: str, password: str, username: str) -> User:
+    """
+    Inserts a user into the database and returns back a User object.
+    The password supplied must be a plain text password, this function
+    hashes the password.
+    """
+    user_id = uuid.uuid4().hex
+    # hash and salt the password
+    hashed_password = bcrypt.hashpw(password.encode(), bcrypt.gensalt())
+
+    async with db_connection_pool.acquire() as connection:
+        query = "INSERT INTO app_user VALUES ($1, $2, $3, $4)"
+        await connection.execute(query, user_id, username, email, hashed_password)
+
+    return User(
+        user_id=user_id,
+        username=username,
+        email=email,
+        password=password
+    )
+
+
 @app.post("/api/v1/login")
 async def login(user_login: UserLogin, response: Response, request: Request):
     user = await get_user(user_login.email)
@@ -262,44 +285,26 @@ async def login(user_login: UserLogin, response: Response, request: Request):
 
 
 @app.post("/api/v1/register")
-def register(userRegister: UserRegister, response: Response):
-    conn = getDbConnection()
-    cur = conn.cursor()
-    # Check if user is already registered
-    query = "SELECT email from app_user where email = %s"
-    cur.execute(query, (userRegister.email,))
-
-    userExists = cur.fetchone()
-
-    if userExists:
-        cur.close()
+async def register(user_register: UserRegister, response: Response):
+    user = await get_user(user_register.email)
+    if user:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="user already exists"
         )
     # create the user
     else:
-        userId = uuid.uuid4()
-        hashedPassword = bcrypt.hashpw(userRegister.password, bcrypt.gensalt())
-        print(hashedPassword)
-        query = "INSERT INTO app_user VALUES (%s, %s, %s, %s)"
-        cur.execute(
-            query,
-            (userId, userRegister.username, userRegister.email, hashedPassword)
-        )
-        cur.close()
-        conn.commit()
-        conn.close()
+        user = await create_user(email=user_register.email, password=user_register.password,
+                                 username=user_register.username)
         response.status_code = status.HTTP_201_CREATED
-
         # User space/root user directory is named with a hash of the user's id
-        hash = hashlib.sha256(userId.hex.encode()).hexdigest()
+        userspace = hashlib.sha256(user.user_id.encode()).hexdigest()
         # If the user space doesn't exist already, create one
-        os.makedirs(os.path.join(USERSPACES, hash))
+        await aos.makedirs(os.path.join(USERSPACES, userspace))
         return {
-            "id": userId.hex,
-            "username": userRegister.username,
-            "email": userRegister.email
+            "id": user.user_id,
+            "username": user_register.username,
+            "email": user_register.email
         }
 
 
