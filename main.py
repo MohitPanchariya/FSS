@@ -228,6 +228,23 @@ def is_session_active(session_id: str) -> bool:
             return True
 
 
+def file_exists(user_id: str, file_path: str) -> bool:
+    """
+    This function checks if a file exists in the userspace
+    of a user.
+    Returns True if the file exists and False otherwise.
+    Note: The file_path argument must be a relative path
+    from the USERSPACE directory. The file_path doesn't need
+    to be sanitised.
+    """
+    sanitised_path = helpers.sanitise_file_path(file_path)
+    userspace = hashlib.sha256(user_id.encode()).hexdigest()
+
+    # check if the file exists
+    if not os.path.exists(os.path.join(USERSPACES, userspace, sanitised_path)):
+        return False
+    return True
+
 def create_session(
         user_id: str,
         session_id: str,
@@ -363,7 +380,7 @@ def upload_file(
     # cur = conn.cursor()
     #
     # query = "SELECT user_id FROM user_session WHERE id = %s"
-    # cur.execute(query, (sessionId,))
+    # cur.execute(query, (session_id,))
     #
     # result = cur.fetchone()
     # userId = result["user_id"]
@@ -405,54 +422,40 @@ def upload_file(
 
 # End point to get the signature file for a particular file in a user-space
 @app.get("/api/v1/path/{file_path: path}")
-def getSigFile(file_path: str, sessionId: Annotated[str | None, Depends(login_required)]):
-    '''
+def get_sig_file(file_path: str, session_id: Annotated[str | None, Depends(login_required)]):
+    """
     This endpoint is used to get a signature file in a user space for the 
     provided file.
     The client can then use the signature file to compute a delta file and
     send a request to the server to update the file.
-    '''
-
-    conn = getDbConnection()
-    cur = conn.cursor()
-
-    query = "SELECT user_id FROM user_session WHERE id = %s"
-    cur.execute(query, (sessionId,))
-
-    result = cur.fetchone()
-    userId = result["user_id"]
-
-    cur.close()
-    conn.close()
-
-    sanitisedPath = helpers.sanitise_file_path(file_path)
-
-    basePath = os.path.split(sanitisedPath)[0]
-    filename = os.path.split(sanitisedPath)[1]
-
-    userSpace = hashlib.sha256(userId.hex.encode()).hexdigest()
-
-    # check if the file exists
-    if (not os.path.exists(os.path.join(USERSPACES, userSpace, sanitisedPath))):
+    """
+    user = get_user_by_session(session_id)
+    if not file_exists(user_id=user.user_id, file_path=file_path):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="File with specified path not found"
         )
 
+    sanitised_path = helpers.sanitise_file_path(file_path)
+
+    base_path = os.path.split(sanitised_path)[0]
+    filename = os.path.split(sanitised_path)[1]
+
+    userspace = hashlib.sha256(user.user_id.encode()).hexdigest()
+
     # create the signatures directory if it doesn't exist
-    print(os.path.join(USERSPACES, userSpace, basePath, ".signatures"))
-    os.makedirs(os.path.join(USERSPACES, userSpace, basePath, ".signatures"), exist_ok=True)
+    os.makedirs(os.path.join(USERSPACES, userspace, base_path, ".signatures"), exist_ok=True)
 
     # create the signature file for the requested file and store it in the signatures directory
     checksum = rdiff.signature.Checksum()
     signature = rdiff.signature.Signature(checksum)
     signature.createSignature(
-        basisFilePath=os.path.join(USERSPACES, userSpace, sanitisedPath),
-        sigFilePath=os.path.join(USERSPACES, userSpace, basePath, ".signatures", filename)
+        basisFilePath=os.path.join(USERSPACES, userspace, sanitised_path),
+        sigFilePath=os.path.join(USERSPACES, userspace, base_path, ".signatures", filename)
     )
 
     return FileResponse(
-        os.path.join(USERSPACES, userSpace, basePath, ".signatures", filename),
+        os.path.join(USERSPACES, userspace, base_path, ".signatures", filename),
         filename=f"{filename}.sig",
         media_type="application/octet-stream"
     )
