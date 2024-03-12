@@ -89,7 +89,7 @@ def extract_cookie(signed_cookie) -> Optional[str]:
     try:
         cookie = serializer.loads(signed_cookie)
         return cookie
-    except Exception as e:
+    except Exception:
         return None
 
 
@@ -244,6 +244,7 @@ def file_exists(user_id: str, file_path: str) -> bool:
     if not os.path.exists(os.path.join(USERSPACES, userspace, sanitised_path)):
         return False
     return True
+
 
 def create_session(
         user_id: str,
@@ -463,44 +464,34 @@ def get_sig_file(file_path: str, session_id: Annotated[str | None, Depends(login
 
 # End point to push changes to a file in a user-space
 @app.patch("/api/v1/update-file")
-def patchFile(
+def patch_file(
         file_path: Annotated[str, Form()],
         delta_file: UploadFile,
-        sessionId: Annotated[str | None, Depends(login_required)]
+        session_id: Annotated[str | None, Depends(login_required)]
 ):
-    '''
+    """
     This endpoint is used to update a file in a user-space. The client needs
     to provide a user email to identify the user space. Along with this,
     the client also needs to send a delta file, representing the changes to be
     made to the file.
     The file to be updated is identified by the file_path, which is
     relative path from base dir + filename.
-    '''
-    conn = getDbConnection()
-    cur = conn.cursor()
-
-    query = "SELECT user_id FROM user_session WHERE id = %s"
-    cur.execute(query, (sessionId,))
-
-    result = cur.fetchone()
-    userId = result["user_id"]
-
-    cur.close()
-    conn.close()
-
-    sanitisedPath = helpers.sanitise_file_path(file_path)
-
-    basePath = os.path.split(sanitisedPath)[0]
-
-    userSpace = hashlib.sha256(userId.hex.encode()).hexdigest()
-
+    """
+    user = get_user_by_session(session_id=session_id)
     # check if the file exists
-    if (not os.path.exists(os.path.join(USERSPACES, userSpace, sanitisedPath))):
+    if not file_exists(user_id=user.user_id, file_path=file_path):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="File with specified path not found"
         )
 
+    sanitised_path = helpers.sanitise_file_path(file_path)
+
+    base_path = os.path.split(sanitised_path)[0]
+
+    userspace = hashlib.sha256(user.user_id.encode()).hexdigest()
+    temp_out_file = None
+    temp_delta_file = None
     # Perform the patch operation
     try:
 
@@ -509,42 +500,44 @@ def patchFile(
         # temporarily on the server to perform the file patch operation.
 
         # create a temporary delta file
-        tempDeltaFile = tempfile.NamedTemporaryFile(mode="wb", delete=False)
-        shutil.copyfileobj(delta_file.file, tempDeltaFile)
-        tempDeltaFile.close()
+        temp_delta_file = tempfile.NamedTemporaryFile(mode="wb", delete=False)
+        shutil.copyfileobj(delta_file.file, temp_delta_file)
+        temp_delta_file.close()
 
         # create a temporary out file to store the updated file
-        tempOutFile = tempfile.NamedTemporaryFile(
+        temp_out_file = tempfile.NamedTemporaryFile(
             mode="wb", delete=False,
-            dir=os.path.join(USERSPACES, userSpace, basePath)
+            dir=os.path.join(USERSPACES, userspace, base_path)
         )
 
         patcher = rdiff.patch.Patch()
         patcher.patchFile(
-            tempDeltaFile.name,
-            os.path.join(USERSPACES, userSpace, sanitisedPath),
-            tempOutFile.name
+            temp_delta_file.name,
+            os.path.join(USERSPACES, userspace, sanitised_path),
+            temp_out_file.name
         )
 
-        tempOutFile.close()
+        temp_out_file.close()
 
         # Atomically rename the temporary file to the actual filename
-        os.replace(tempOutFile.name, os.path.join(USERSPACES, userSpace, sanitisedPath))
+        os.replace(temp_out_file.name, os.path.join(USERSPACES, userspace, sanitised_path))
     except Exception:
         # remove the temp updated file
-        os.remove(tempOutFile.name)
+        if temp_out_file:
+            os.remove(temp_out_file.name)
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Invalid delta file."
         )
     finally:
         # remove the temp delta file
-        os.remove(tempDeltaFile.name)
+        if temp_delta_file:
+            os.remove(temp_delta_file.name)
 
     return {
         "path_in_user_dir": os.path.relpath(
-            os.path.join(USERSPACES, userSpace, sanitisedPath),
-            os.path.join(USERSPACES, userSpace)
+            os.path.join(USERSPACES, userspace, sanitised_path),
+            os.path.join(USERSPACES, userspace)
         )
     }
 
