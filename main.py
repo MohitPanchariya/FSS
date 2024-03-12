@@ -549,11 +549,11 @@ def patchFile(
     }
 
 
-def deleteTempDeltaFile(filepath):
-    '''
+def delete_temp_delta_file(filepath):
+    """
     This function is used to delete the temporary delta file created when
     the client makes a request to the /api/v1/pull-change route.
-    '''
+    """
     os.remove(filepath)
 
 
@@ -634,7 +634,7 @@ def getDeltaFile(
         os.remove(tempSigFile.name)
 
     # Background task to delete the temporary delta file produced
-    backgroundTasks.add_task(deleteTempDeltaFile, tempDeltaFile.name)
+    backgroundTasks.add_task(delete_temp_delta_file, tempDeltaFile.name)
 
     return FileResponse(
         os.path.join(USERSPACES, userSpace, basePath, tempDeltaFile.name),
