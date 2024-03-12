@@ -34,6 +34,7 @@ serializer = URLSafeSerializer(SECRET_KEY)
 db_connection_pool_async = None
 db_connection_pool = None
 
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global db_connection_pool_async
@@ -111,6 +112,7 @@ def delete_expired_session(session_id):
     cursor.close()
     connection.commit()
     db_connection_pool.putconn(connection)
+
 
 def login_required(request: Request):
     """
@@ -191,6 +193,7 @@ def get_user(user_email: str = None, user_id: str = None) -> Optional[User]:
         password=user_data["password"]
     )
 
+
 async def get_user_by_session(session_id: str) -> Optional[User]:
     """
     Returns a User object if the session exists. Else returns None.
@@ -229,6 +232,7 @@ def is_session_active(session_id: str) -> bool:
         else:
             return True
 
+
 def create_session(
         user_id: str,
         session_id: str,
@@ -247,7 +251,7 @@ def create_session(
     db_connection_pool.putconn(connection)
 
 
-async def create_user(email: str, password: str, username: str) -> User:
+def create_user(email: str, password: str, username: str) -> User:
     """
     Inserts a user into the database and returns back a User object.
     The password supplied must be a plain text password, this function
@@ -257,9 +261,13 @@ async def create_user(email: str, password: str, username: str) -> User:
     # hash and salt the password
     hashed_password = bcrypt.hashpw(password.encode(), bcrypt.gensalt())
 
-    async with db_connection_pool_async.acquire() as connection:
-        query = "INSERT INTO app_user VALUES ($1, $2, $3, $4)"
-        await connection.execute(query, user_id, username, email, hashed_password)
+    connection = db_connection_pool.getconn()
+    cursor = connection.cursor()
+    query = "INSERT INTO app_user VALUES(%s, %s, %s, %s)"
+    cursor.execute(query, (user_id, username, email, hashed_password))
+    cursor.close()
+    connection.commit()
+    db_connection_pool.putconn(connection)
 
     return User(
         user_id=user_id,
@@ -324,8 +332,8 @@ def login(user_login: UserLogin, response: Response, request: Request):
 
 
 @app.post("/api/v1/register")
-async def register(user_register: UserRegister, response: Response):
-    user = await get_user(user_register.email)
+def register(user_register: UserRegister, response: Response):
+    user = get_user(user_register.email)
     if user:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
@@ -333,13 +341,13 @@ async def register(user_register: UserRegister, response: Response):
         )
     # create the user
     else:
-        user = await create_user(email=user_register.email, password=user_register.password,
-                                 username=user_register.username)
+        user = create_user(email=user_register.email, password=user_register.password,
+                           username=user_register.username)
         response.status_code = status.HTTP_201_CREATED
         # User space/root user directory is named with a hash of the user's id
         userspace = hashlib.sha256(user.user_id.encode()).hexdigest()
         # If the user space doesn't exist already, create one
-        await aos.makedirs(os.path.join(USERSPACES, userspace))
+        os.makedirs(os.path.join(USERSPACES, userspace))
         return {
             "id": user.user_id,
             "username": user_register.username,
