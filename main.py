@@ -559,58 +559,46 @@ def delete_temp_delta_file(filepath):
 
 # Endpoint to pull changes for a file in a user-space
 @app.post("/api/v1/pull-change")
-def getDeltaFile(
+def get_delta_file(
         file_path: Annotated[str, Form()],
         sig_file: UploadFile,
-        backgroundTasks: BackgroundTasks,
-        sessionId: Annotated[str | None, Depends(login_required)]
+        background_task: BackgroundTasks,
+        session_id: Annotated[str | None, Depends(login_required)]
 ):
-    '''
+    """
     This endpoint is used to get a delta file for a file specified by the client.
     The delta file is produced against the signature file provided by the client
     and sent back to the client. The client can then use this delta file to patch
     the file to be updated on the client machine. Thus, the server and client
     now have the same version of the file.
-    '''
-    conn = getDbConnection()
-    cur = conn.cursor()
-
-    query = "SELECT user_id FROM user_session WHERE id = %s"
-    cur.execute(query, (sessionId,))
-
-    result = cur.fetchone()
-    userId = result["user_id"]
-
-    cur.close()
-    conn.close()
-
-    sanitisedPath = helpers.sanitise_file_path(file_path)
-
-    basePath = os.path.split(sanitisedPath)[0]
-    filename = os.path.split(sanitisedPath)[1]
-
-    userSpace = hashlib.sha256(userId.hex.encode()).hexdigest()
-
-    # check if the file exists
-    if (not os.path.exists(os.path.join(USERSPACES, userSpace, sanitisedPath))):
+    """
+    user = get_user_by_session(session_id=session_id)
+    if not file_exists(user_id=user.user_id, file_path=file_path):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="File with specified path not found"
         )
+
+    sanitised_path = helpers.sanitise_file_path(file_path)
+
+    base_path = os.path.split(sanitised_path)[0]
+    filename = os.path.split(sanitised_path)[1]
+
+    userspace = hashlib.sha256(user.user_id.encode()).hexdigest()
 
     # Due to a limitation in the rdiff package (it requires file paths and
     # not file like objects)the sig_file needs to be saved
     # temporarily on the server to create the delta file
 
     # create a temporary signature file
-    tempSigFile = tempfile.NamedTemporaryFile(mode="wb", delete=False)
-    shutil.copyfileobj(sig_file.file, tempSigFile)
-    tempSigFile.close()
+    temp_sig_file = tempfile.NamedTemporaryFile(mode="wb", delete=False)
+    shutil.copyfileobj(sig_file.file, temp_sig_file)
+    temp_sig_file.close()
 
     # create a temporary file to store the delta file
-    tempDeltaFile = tempfile.NamedTemporaryFile(
+    temp_delta_file = tempfile.NamedTemporaryFile(
         mode="wb", delete=False,
-        dir=os.path.join(USERSPACES, userSpace, basePath)
+        dir=os.path.join(USERSPACES, userspace, base_path)
     )
 
     # Populate the delta file
@@ -618,9 +606,9 @@ def getDeltaFile(
         checksum = rdiff.signature.Checksum()
         delta = rdiff.delta.Delta()
         delta.createDeltaFile(
-            inFilePath=os.path.join(USERSPACES, userSpace, sanitisedPath),
-            deltaFilePath=tempDeltaFile.name,
-            sigFielPath=tempSigFile.name,
+            inFilePath=os.path.join(USERSPACES, userspace, sanitised_path),
+            deltaFilePath=temp_delta_file.name,
+            sigFielPath=temp_sig_file.name,
             blockSize=1024,  # default block size used to create the sig file
             checksum=checksum
         )
@@ -631,13 +619,13 @@ def getDeltaFile(
         )
     finally:
         # remove the temp signature file
-        os.remove(tempSigFile.name)
+        os.remove(temp_sig_file.name)
 
     # Background task to delete the temporary delta file produced
-    backgroundTasks.add_task(delete_temp_delta_file, tempDeltaFile.name)
+    background_task.add_task(delete_temp_delta_file, temp_delta_file.name)
 
     return FileResponse(
-        os.path.join(USERSPACES, userSpace, basePath, tempDeltaFile.name),
+        os.path.join(USERSPACES, userspace, base_path, temp_delta_file.name),
         filename=f"{filename}.delta",
         media_type="application/octet-stream"
     )
