@@ -21,7 +21,9 @@ import bcrypt
 import uuid
 import datetime
 import asyncpg
+import aiofiles as aio
 import aiofiles.os as aos
+import psycopg2.pool
 
 dbParameters = {}
 register_uuid()
@@ -29,13 +31,14 @@ register_uuid()
 SECRET_KEY = token_hex()
 serializer = URLSafeSerializer(SECRET_KEY)
 
+db_connection_pool_async = None
 db_connection_pool = None
-
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global db_connection_pool
+    global db_connection_pool_async
     global dbParameters
+    global db_connection_pool
     load_dotenv(dotenv_path=".env")
     dbParameters["database"] = os.environ["DB_NAME"]
     dbParameters["user"] = os.environ["DB_USER"]
@@ -44,11 +47,15 @@ async def lifespan(app: FastAPI):
     dbParameters["port"] = os.environ["DB_PORT"]
 
     # create the connection pool on startup
-    db_connection_pool = await asyncpg.create_pool(**dbParameters, min_size=1)
-
+    db_connection_pool_async = await asyncpg.create_pool(**dbParameters, min_size=1)
+    db_connection_pool = psycopg2.pool.ThreadedConnectionPool(
+        minconn=1, maxconn=10, **dbParameters,
+        cursor_factory=DictCursor
+    )
     yield
     # close the connections on application shutdown
-    await db_connection_pool.close()
+    await db_connection_pool_async.close()
+    db_connection_pool.closeall()
 
 
 app = FastAPI(lifespan=lifespan)
@@ -92,17 +99,20 @@ def extract_cookie(signed_cookie) -> Optional[str]:
         return None
 
 
-async def delete_expired_session(session_id):
+def delete_expired_session(session_id):
     """
     Deletes the session with the given session_id from
     the database.
     """
-    async with db_connection_pool.acquire() as connection:
-        query = "DELETE FROM user_session WHERE id = $1"
-        await connection.execute(query, session_id)
+    query = "DELETE FROM user_session WHERE id = %s"
+    connection = db_connection_pool.getconn()
+    cursor = connection.cursor()
+    cursor.execute(query, (session_id,))
+    cursor.close()
+    connection.commit()
+    db_connection_pool.putconn(connection)
 
-
-async def login_required(request: Request):
+def login_required(request: Request):
     """
     This function is used to check if a user is logged in
     by inspecting the user's cookie.
@@ -121,16 +131,15 @@ async def login_required(request: Request):
         )
     try:
         session_id = serializer.loads(signed_session_id)
-        async with db_connection_pool.acquire() as connection:
-            async with connection.transaction():
-                query = "SELECT * FROM user_session WHERE id = $1"
-                cur = await connection.cursor(query, session_id)
-                result = await cur.fetchrow()
+        connection = db_connection_pool.getconn()
+        cursor = connection.cursor()
+        query = "SELECT * FROM user_session WHERE id = %s"
+        result = cursor.execute(query, (session_id,))
 
         if result:
             # session has expired
             if result["expires_at"] < datetime.datetime.now():
-                await delete_expired_session(session_id)
+                delete_expired_session(session_id)
             # session is still valid
             else:
                 return session_id
@@ -151,48 +160,76 @@ async def login_required(request: Request):
         )
 
 
-async def get_user(user_email: str) -> Optional[User]:
+def get_user(user_email: str = None, user_id: str = None) -> Optional[User]:
     """
-    Returns a User object if the user exists.
-    Else returns None.
+    Returns a User object if the user exists. Else returns None.
+    If neither the user_email nor user_id is specified, the function returns None
     """
-    async with db_connection_pool.acquire() as connection:
+    if not user_email and not user_id:
+        return None
+
+    connection = db_connection_pool.getconn()
+    cursor = connection.cursor()
+
+    if user_id:
+        query = "SELECT * from app_user where id = %s"
+        cursor.execute(query, (user_id,))
+    else:
+        query = "SELECT * from app_user where email = %s"
+        cursor.execute(query, (user_email,))
+
+    user_data = cursor.fetchone()
+    cursor.close()
+    db_connection_pool.putconn(connection)
+
+    if not user_data:
+        return None
+    return User(
+        user_id=user_data["id"].hex,
+        email=user_data["email"],
+        username=user_data["username"],
+        password=user_data["password"]
+    )
+
+async def get_user_by_session(session_id: str) -> Optional[User]:
+    """
+    Returns a User object if the session exists. Else returns None.
+    """
+    async with db_connection_pool_async.acquire() as connection:
         async with connection.transaction():
-            query = "SELECT * from app_user where email = $1"
-            cur = await connection.cursor(query, user_email)
-            user_data = await cur.fetchrow()
-            if not user_data:
+            query = "SELECT user_id from user_session where id = $1"
+            cur = await connection.cursor(query, session_id)
+            record = await cur.fetchrow()
+            user_id = record["user_id"]
+            if not user_id:
                 return None
-            return User(
-                user_id=user_data["id"],
-                email=user_data["email"],
-                username=user_data["username"],
-                password=user_data["password"]
-            )
+            return await get_user(user_id=user_id.hex)
 
 
-async def is_session_active(session_id: str) -> bool:
+def is_session_active(session_id: str) -> bool:
     """
     Returns True if the session is active and False otherwise.
     Deletes the session entry from the database if the session
     has expired.
     """
-    async with db_connection_pool.acquire() as connection:
-        async with connection.transaction():
-            query = "SELECT expires_at FROM user_session WHERE id = $1"
-            cur = await connection.cursor(query, session_id)
-            session_data = await cur.fetchrow()
-            if session_data:
-                # session has expired
-                if session_data["expires_at"] < datetime:
-                    await delete_expired_session(session_id)
-                    return False
-                # session is still active
-                else:
-                    return True
+    connection = db_connection_pool.getconn()
+    cursor = connection.cursor()
+    query = "SELECT expires_at FROM user_session WHERE id = %s"
+    cursor.execute(query, (session_id,))
+    session_data = cursor.fetchone()
+    cursor.close()
+    db_connection_pool.putconn(connection)
 
+    if session_data:
+        # session has expired
+        if session_data["expires_at"] < datetime.datetime.now():
+            delete_expired_session(session_id)
+            return False
+        # session is still active
+        else:
+            return True
 
-async def create_session(
+def create_session(
         user_id: str,
         session_id: str,
         created_at: datetime.datetime,
@@ -201,11 +238,13 @@ async def create_session(
     """
     Inserts a session into the database.
     """
-    async with db_connection_pool.acquire() as connection:
-        query = "INSERT INTO user_session VALUES($1, $2, $3, $4)"
-        await connection.execute(
-            query, session_id, user_id, created_at, expires_at
-        )
+    connection = db_connection_pool.getconn()
+    cursor = connection.cursor()
+    query = "INSERT INTO user_session VALUES(%s, %s, %s, %s)"
+    cursor.execute(query, (session_id, user_id, created_at, expires_at))
+    cursor.close()
+    connection.commit()
+    db_connection_pool.putconn(connection)
 
 
 async def create_user(email: str, password: str, username: str) -> User:
@@ -218,7 +257,7 @@ async def create_user(email: str, password: str, username: str) -> User:
     # hash and salt the password
     hashed_password = bcrypt.hashpw(password.encode(), bcrypt.gensalt())
 
-    async with db_connection_pool.acquire() as connection:
+    async with db_connection_pool_async.acquire() as connection:
         query = "INSERT INTO app_user VALUES ($1, $2, $3, $4)"
         await connection.execute(query, user_id, username, email, hashed_password)
 
@@ -231,8 +270,8 @@ async def create_user(email: str, password: str, username: str) -> User:
 
 
 @app.post("/api/v1/login")
-async def login(user_login: UserLogin, response: Response, request: Request):
-    user = await get_user(user_login.email)
+def login(user_login: UserLogin, response: Response, request: Request):
+    user = get_user(user_login.email)
 
     # user doesn't exist
     if not user:
@@ -246,10 +285,10 @@ async def login(user_login: UserLogin, response: Response, request: Request):
         # If the session cookie is valid, check if the user already has an
         # active session against this session_id
         if session_id:
-            session_active = await is_session_active(session_id)
+            session_active = is_session_active(session_id)
             if session_active:
                 return {
-                    "id": str(user.user_id),
+                    "id": user.user_id,
                     "email": user.email
                 }
 
@@ -269,7 +308,7 @@ async def login(user_login: UserLogin, response: Response, request: Request):
         created_at = datetime.datetime.now()
         expires_at = created_at + datetime.timedelta(hours=1)
         # insert session into database
-        await create_session(user.user_id, session_id.hex, created_at, expires_at)
+        create_session(user.user_id, session_id.hex, created_at, expires_at)
 
         response.set_cookie(
             key="session-id",
@@ -279,7 +318,7 @@ async def login(user_login: UserLogin, response: Response, request: Request):
         )
 
         return {
-            "id": str(user.user_id),
+            "id": user.user_id,
             "email": user.email
         }
 
@@ -309,20 +348,13 @@ async def register(user_register: UserRegister, response: Response):
 
 
 # End point to upload a file to a user-space
-@app.post("/api/v1/upload-file", status_code=status.HTTP_201_CREATED)
-async def upload_file(
+@app.post("/api/v1/sync/upload-file", status_code=status.HTTP_201_CREATED)
+def upload_file_sync(
         path_from_base: Annotated[str, Form()],
         file: UploadFile,
         sessionId: Annotated[str | None, Depends(login_required)]
 ):
     user_id = None
-    async with db_connection_pool.acquire() as connection:
-        async with connection.transaction():
-            query = "SELECT user_id FROM user_session WHERE id = $1"
-            cur = await connection.cursor(query, (sessionId))
-            result = cur.fetchrow()
-            print(result)
-            userId = result["user_id"]
 
     conn = getDbConnection()
     cur = conn.cursor()
@@ -337,8 +369,8 @@ async def upload_file(
     conn.close()
 
     # sanitise the client provided path
-    sanitisedPathFromBase = helpers.sanitiseFilepath(path_from_base)
-    sanitisedFileName = helpers.sanitiseFilepath(file.filename)
+    sanitisedPathFromBase = helpers.sanitise_file_path(path_from_base)
+    sanitisedFileName = helpers.sanitise_file_path(file.filename)
 
     userSpace = hashlib.sha256(userId.hex.encode()).hexdigest()
     pathInUserSpace = os.path.join(USERSPACES, userSpace, sanitisedPathFromBase)
@@ -390,7 +422,7 @@ def getSigFile(file_path: str, sessionId: Annotated[str | None, Depends(login_re
     cur.close()
     conn.close()
 
-    sanitisedPath = helpers.sanitiseFilepath(file_path)
+    sanitisedPath = helpers.sanitise_file_path(file_path)
 
     basePath = os.path.split(sanitisedPath)[0]
     filename = os.path.split(sanitisedPath)[1]
@@ -450,7 +482,7 @@ def patchFile(
     cur.close()
     conn.close()
 
-    sanitisedPath = helpers.sanitiseFilepath(file_path)
+    sanitisedPath = helpers.sanitise_file_path(file_path)
 
     basePath = os.path.split(sanitisedPath)[0]
 
@@ -546,7 +578,7 @@ def getDeltaFile(
     cur.close()
     conn.close()
 
-    sanitisedPath = helpers.sanitiseFilepath(file_path)
+    sanitisedPath = helpers.sanitise_file_path(file_path)
 
     basePath = os.path.split(sanitisedPath)[0]
     filename = os.path.split(sanitisedPath)[1]
