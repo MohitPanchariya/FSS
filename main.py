@@ -20,9 +20,6 @@ import psycopg2
 import bcrypt
 import uuid
 import datetime
-import asyncpg
-import aiofiles as aio
-import aiofiles.os as aos
 import psycopg2.pool
 
 dbParameters = {}
@@ -31,13 +28,11 @@ register_uuid()
 SECRET_KEY = token_hex()
 serializer = URLSafeSerializer(SECRET_KEY)
 
-db_connection_pool_async = None
 db_connection_pool = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global db_connection_pool_async
     global dbParameters
     global db_connection_pool
     load_dotenv(dotenv_path=".env")
@@ -48,14 +43,12 @@ async def lifespan(app: FastAPI):
     dbParameters["port"] = os.environ["DB_PORT"]
 
     # create the connection pool on startup
-    db_connection_pool_async = await asyncpg.create_pool(**dbParameters, min_size=1)
     db_connection_pool = psycopg2.pool.ThreadedConnectionPool(
         minconn=1, maxconn=10, **dbParameters,
         cursor_factory=DictCursor
     )
     yield
     # close the connections on application shutdown
-    await db_connection_pool_async.close()
     db_connection_pool.closeall()
 
 
@@ -136,8 +129,8 @@ def login_required(request: Request):
         connection = db_connection_pool.getconn()
         cursor = connection.cursor()
         query = "SELECT * FROM user_session WHERE id = %s"
-        result = cursor.execute(query, (session_id,))
-
+        cursor.execute(query, (session_id,))
+        result = cursor.fetchone()
         if result:
             # session has expired
             if result["expires_at"] < datetime.datetime.now():
@@ -194,19 +187,21 @@ def get_user(user_email: str = None, user_id: str = None) -> Optional[User]:
     )
 
 
-async def get_user_by_session(session_id: str) -> Optional[User]:
+def get_user_by_session(session_id: str) -> Optional[User]:
     """
     Returns a User object if the session exists. Else returns None.
     """
-    async with db_connection_pool_async.acquire() as connection:
-        async with connection.transaction():
-            query = "SELECT user_id from user_session where id = $1"
-            cur = await connection.cursor(query, session_id)
-            record = await cur.fetchrow()
-            user_id = record["user_id"]
-            if not user_id:
-                return None
-            return await get_user(user_id=user_id.hex)
+    connection = db_connection_pool.getconn()
+    cursor = connection.cursor()
+    query = "SELECT user_id from user_session where id = %s"
+    cursor.execute(query, (session_id,))
+    user_data = cursor.fetchone()
+    cursor.close()
+    db_connection_pool.putconn(connection)
+
+    if not user_data["user_id"]:
+        return None
+    return get_user(user_id=user_data["user_id"])
 
 
 def is_session_active(session_id: str) -> bool:
@@ -356,39 +351,39 @@ def register(user_register: UserRegister, response: Response):
 
 
 # End point to upload a file to a user-space
-@app.post("/api/v1/sync/upload-file", status_code=status.HTTP_201_CREATED)
-def upload_file_sync(
+@app.post("/api/v1/upload-file", status_code=status.HTTP_201_CREATED)
+def upload_file(
         path_from_base: Annotated[str, Form()],
         file: UploadFile,
-        sessionId: Annotated[str | None, Depends(login_required)]
+        session_id: Annotated[str | None, Depends(login_required)]
 ):
-    user_id = None
+    user = get_user_by_session(session_id)
 
-    conn = getDbConnection()
-    cur = conn.cursor()
-
-    query = "SELECT user_id FROM user_session WHERE id = %s"
-    cur.execute(query, (sessionId,))
-
-    result = cur.fetchone()
-    userId = result["user_id"]
-
-    cur.close()
-    conn.close()
+    # conn = getDbConnection()
+    # cur = conn.cursor()
+    #
+    # query = "SELECT user_id FROM user_session WHERE id = %s"
+    # cur.execute(query, (sessionId,))
+    #
+    # result = cur.fetchone()
+    # userId = result["user_id"]
+    #
+    # cur.close()
+    # conn.close()
 
     # sanitise the client provided path
-    sanitisedPathFromBase = helpers.sanitise_file_path(path_from_base)
-    sanitisedFileName = helpers.sanitise_file_path(file.filename)
+    sanitised_path_from_base = helpers.sanitise_file_path(path_from_base)
+    sanitised_file_name = helpers.sanitise_file_path(file.filename)
 
-    userSpace = hashlib.sha256(userId.hex.encode()).hexdigest()
-    pathInUserSpace = os.path.join(USERSPACES, userSpace, sanitisedPathFromBase)
+    userspace = hashlib.sha256(user.user_id.encode()).hexdigest()
+    path_in_userspace = os.path.join(USERSPACES, userspace, sanitised_path_from_base)
     # create the directories inside the user space
-    os.makedirs(pathInUserSpace, exist_ok=True)
+    os.makedirs(path_in_userspace, exist_ok=True)
 
     # check if user provided path from base and file name correspond to a directory
     # inside the user space. If it does, the user will have to either delete the
     # directory or use a different file name to store the file.
-    if (os.path.isdir(os.path.join(pathInUserSpace, sanitisedFileName))):
+    if os.path.isdir(os.path.join(path_in_userspace, sanitised_file_name)):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Directory with the same name as the file exists in the" \
@@ -397,13 +392,13 @@ def upload_file_sync(
         )
 
     # create the file inside the user space
-    with open(os.path.join(pathInUserSpace, sanitisedFileName), "wb") as out:
+    with open(os.path.join(path_in_userspace, sanitised_file_name), "wb") as out:
         shutil.copyfileobj(file.file, out)
 
     return {
         "path_in_user_dir": os.path.relpath(
-            os.path.join(pathInUserSpace, sanitisedFileName),
-            os.path.join(USERSPACES, userSpace)
+            os.path.join(path_in_userspace, sanitised_file_name),
+            os.path.join(USERSPACES, userspace)
         )
     }
 
