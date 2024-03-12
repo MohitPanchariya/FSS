@@ -78,10 +78,6 @@ class User:
         self.password = password
 
 
-def getDbConnection():
-    return psycopg2.connect(**dbParameters, cursor_factory=DictCursor)
-
-
 def extract_cookie(signed_cookie) -> Optional[str]:
     """
     Returns the cookie if it's valid. Else returns None.
