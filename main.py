@@ -161,7 +161,7 @@ def get_user(user_email: str = None, user_id: str = None) -> Optional[User]:
     user_data = cursor.fetchone()
     cursor.close()
     db_connection_pool.putconn(connection)
-
+    print(user_data)
     if not user_data:
         return None
     return User(
@@ -249,32 +249,6 @@ def create_session(
     db_connection_pool.putconn(connection)
 
 
-def create_user(email: str, password: str, username: str) -> User:
-    """
-    Inserts a user into the database and returns back a User object.
-    The password supplied must be a plain text password, this function
-    hashes the password.
-    """
-    user_id = uuid.uuid4().hex
-    # hash and salt the password
-    hashed_password = bcrypt.hashpw(password.encode(), bcrypt.gensalt())
-
-    connection = db_connection_pool.getconn()
-    cursor = connection.cursor()
-    query = "INSERT INTO app_user VALUES(%s, %s, %s, %s)"
-    cursor.execute(query, (user_id, username, email, hashed_password))
-    cursor.close()
-    connection.commit()
-    db_connection_pool.putconn(connection)
-
-    return User(
-        user_id=user_id,
-        username=username,
-        email=email,
-        password=password
-    )
-
-
 @app.post("/api/v1/login")
 def login(user_login: UserLogin, response: Response, request: Request):
     user = get_user(user_login.email)
@@ -339,8 +313,14 @@ def register(user_register: UserRegister, response: Response):
         )
     # create the user
     else:
-        user = create_user(email=user_register.email, password=user_register.password,
-                           username=user_register.username)
+        db_conn = db_connection_pool.getconn()
+        hashed_password = bcrypt.hashpw(user_register.password.encode(), bcrypt.gensalt())
+        user = User.insert_user_to_db(
+            user_id=uuid.uuid4(), username=user_register.username, email=user_register.email,
+            hashed_password=hashed_password, db_conn=db_conn
+        )
+        db_connection_pool.putconn(db_conn)
+
         response.status_code = status.HTTP_201_CREATED
         # User space/root user directory is named with a hash of the user's id
         userspace = hashlib.sha256(user.user_id.encode()).hexdigest()
