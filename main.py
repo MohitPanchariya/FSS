@@ -373,18 +373,6 @@ def upload_file(
 ):
     user = get_user_by_session(session_id)
 
-    # conn = getDbConnection()
-    # cur = conn.cursor()
-    #
-    # query = "SELECT user_id FROM user_session WHERE id = %s"
-    # cur.execute(query, (session_id,))
-    #
-    # result = cur.fetchone()
-    # userId = result["user_id"]
-    #
-    # cur.close()
-    # conn.close()
-
     # sanitise the client provided path
     sanitised_path_from_base = helpers.sanitise_file_path(path_from_base)
     sanitised_file_name = helpers.sanitise_file_path(file.filename)
