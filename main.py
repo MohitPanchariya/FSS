@@ -10,6 +10,7 @@ from dotenv import load_dotenv
 from secrets import token_hex
 from typing import Annotated
 from typing import Optional
+from models.user import User
 import hashlib
 import os
 import shutil
@@ -64,18 +65,6 @@ class UserRegister(BaseModel):
     email: str
     password: str
     username: str
-
-
-class User:
-    """
-    User model for a user in the database.
-    """
-
-    def __init__(self, user_id: str, username: str, email: str, password: str):
-        self.user_id = user_id
-        self.username = username
-        self.email = email
-        self.password = password
 
 
 def extract_cookie(signed_cookie) -> Optional[str]:
