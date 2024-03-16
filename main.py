@@ -11,6 +11,7 @@ from secrets import token_hex
 from typing import Annotated
 from typing import Optional
 from models.user import User
+from models.session import Session
 import hashlib
 import os
 import shutil
@@ -22,6 +23,7 @@ import bcrypt
 import uuid
 import datetime
 import psycopg2.pool
+import secrets
 
 dbParameters = {}
 register_uuid()
@@ -78,20 +80,6 @@ def extract_cookie(signed_cookie) -> Optional[str]:
         return None
 
 
-def delete_expired_session(session_id):
-    """
-    Deletes the session with the given session_id from
-    the database.
-    """
-    query = "DELETE FROM user_session WHERE id = %s"
-    connection = db_connection_pool.getconn()
-    cursor = connection.cursor()
-    cursor.execute(query, (session_id,))
-    cursor.close()
-    connection.commit()
-    db_connection_pool.putconn(connection)
-
-
 def login_required(request: Request):
     """
     This function is used to check if a user is logged in
@@ -110,8 +98,8 @@ def login_required(request: Request):
             detail="login required."
         )
     try:
-        session_id = serializer.loads(signed_session_id)
         connection = db_connection_pool.getconn()
+        session_id = serializer.loads(signed_session_id)
         cursor = connection.cursor()
         query = "SELECT * FROM user_session WHERE id = %s"
         cursor.execute(query, (session_id,))
@@ -119,7 +107,7 @@ def login_required(request: Request):
         if result:
             # session has expired
             if result["expires_at"] < datetime.datetime.now():
-                delete_expired_session(session_id)
+                Session.delete_expired_session(db_conn=connection, session_id=session_id)
             # session is still valid
             else:
                 return session_id
@@ -138,30 +126,8 @@ def login_required(request: Request):
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Invalid session-id"
         )
-
-
-def is_session_active(session_id: str) -> bool:
-    """
-    Returns True if the session is active and False otherwise.
-    Deletes the session entry from the database if the session
-    has expired.
-    """
-    connection = db_connection_pool.getconn()
-    cursor = connection.cursor()
-    query = "SELECT expires_at FROM user_session WHERE id = %s"
-    cursor.execute(query, (session_id,))
-    session_data = cursor.fetchone()
-    cursor.close()
-    db_connection_pool.putconn(connection)
-
-    if session_data:
-        # session has expired
-        if session_data["expires_at"] < datetime.datetime.now():
-            delete_expired_session(session_id)
-            return False
-        # session is still active
-        else:
-            return True
+    finally:
+        db_connection_pool.putconn(connection)
 
 
 def file_exists(user_id: str, file_path: str) -> bool:
@@ -182,32 +148,13 @@ def file_exists(user_id: str, file_path: str) -> bool:
     return True
 
 
-def create_session(
-        user_id: str,
-        session_id: str,
-        created_at: datetime.datetime,
-        expires_at: datetime.datetime
-):
-    """
-    Inserts a session into the database.
-    """
-    connection = db_connection_pool.getconn()
-    cursor = connection.cursor()
-    query = "INSERT INTO user_session VALUES(%s, %s, %s, %s)"
-    cursor.execute(query, (session_id, user_id, created_at, expires_at))
-    cursor.close()
-    connection.commit()
-    db_connection_pool.putconn(connection)
-
-
 @app.post("/api/v1/login")
 def login(user_login: UserLogin, response: Response, request: Request):
     db_conn = db_connection_pool.getconn()
     user = User.get_user(db_conn=db_conn, user_email=user_login.email)
-    db_connection_pool.putconn(db_conn)
-
     # user doesn't exist
     if not user:
+        db_connection_pool.putconn(db_conn)
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="user not found"
@@ -218,7 +165,7 @@ def login(user_login: UserLogin, response: Response, request: Request):
         # If the session cookie is valid, check if the user already has an
         # active session against this session_id
         if session_id:
-            session_active = is_session_active(session_id)
+            session_active = Session.is_session_active(db_conn=db_conn, session_id=session_id)
             if session_active:
                 return {
                     "id": user.user_id,
@@ -236,13 +183,16 @@ def login(user_login: UserLogin, response: Response, request: Request):
                 detail="email or password is incorrect"
             )
         # create a session for the user
-        session_id = uuid.uuid4()
+        session_id = secrets.token_hex(nbytes=32)
         signed_session_id = serializer.dumps(str(session_id))
         created_at = datetime.datetime.now()
-        expires_at = created_at + datetime.timedelta(hours=1)
+        expires_at = created_at + datetime.timedelta(days=30)
         # insert session into database
-        create_session(user.user_id, session_id.hex, created_at, expires_at)
-
+        Session.insert_into_db(
+            db_conn=db_conn, session_id=session_id, user_id=user.user_id,
+            created_at=created_at, expires_at=expires_at
+        )
+        db_connection_pool.putconn(db_conn)
         response.set_cookie(
             key="session-id",
             value=signed_session_id,
