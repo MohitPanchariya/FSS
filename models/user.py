@@ -1,4 +1,5 @@
 from __future__ import annotations
+from typing import Optional
 import uuid
 
 
@@ -31,3 +32,48 @@ class User:
             email=email,
             password=hashed_password
         )
+
+    @staticmethod
+    def get_user(db_conn, user_email: str = None, user_id: str = None) -> Optional[User]:
+        """
+        Returns a User object if the user exists. Else returns None.
+        If neither the user_email nor user_id is specified, the function returns None
+        """
+        if not user_email and not user_id:
+            return None
+
+        cursor = db_conn.cursor()
+
+        if user_id:
+            query = "SELECT * from app_user where id = %s"
+            cursor.execute(query, (user_id,))
+        else:
+            query = "SELECT * from app_user where email = %s"
+            cursor.execute(query, (user_email,))
+
+        user_data = cursor.fetchone()
+        cursor.close()
+        if not user_data:
+            return None
+        return User(
+            user_id=user_data["id"].hex,
+            email=user_data["email"],
+            username=user_data["username"],
+            password=user_data["password"]
+        )
+
+    @staticmethod
+    def get_user_by_session(db_conn, session_id: str) -> Optional[User]:
+        """
+        Returns a User object if the session exists. Else returns None.
+        """
+        cursor = db_conn.cursor()
+        query = "SELECT user_id from user_session where id = %s"
+        cursor.execute(query, (session_id,))
+        user_data = cursor.fetchone()
+        cursor.close()
+
+        if not user_data["user_id"]:
+            return None
+        user = User.get_user(db_conn, user_id=user_data["user_id"])
+        return user

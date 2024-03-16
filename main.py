@@ -140,55 +140,6 @@ def login_required(request: Request):
         )
 
 
-def get_user(user_email: str = None, user_id: str = None) -> Optional[User]:
-    """
-    Returns a User object if the user exists. Else returns None.
-    If neither the user_email nor user_id is specified, the function returns None
-    """
-    if not user_email and not user_id:
-        return None
-
-    connection = db_connection_pool.getconn()
-    cursor = connection.cursor()
-
-    if user_id:
-        query = "SELECT * from app_user where id = %s"
-        cursor.execute(query, (user_id,))
-    else:
-        query = "SELECT * from app_user where email = %s"
-        cursor.execute(query, (user_email,))
-
-    user_data = cursor.fetchone()
-    cursor.close()
-    db_connection_pool.putconn(connection)
-    print(user_data)
-    if not user_data:
-        return None
-    return User(
-        user_id=user_data["id"].hex,
-        email=user_data["email"],
-        username=user_data["username"],
-        password=user_data["password"]
-    )
-
-
-def get_user_by_session(session_id: str) -> Optional[User]:
-    """
-    Returns a User object if the session exists. Else returns None.
-    """
-    connection = db_connection_pool.getconn()
-    cursor = connection.cursor()
-    query = "SELECT user_id from user_session where id = %s"
-    cursor.execute(query, (session_id,))
-    user_data = cursor.fetchone()
-    cursor.close()
-    db_connection_pool.putconn(connection)
-
-    if not user_data["user_id"]:
-        return None
-    return get_user(user_id=user_data["user_id"])
-
-
 def is_session_active(session_id: str) -> bool:
     """
     Returns True if the session is active and False otherwise.
@@ -251,7 +202,9 @@ def create_session(
 
 @app.post("/api/v1/login")
 def login(user_login: UserLogin, response: Response, request: Request):
-    user = get_user(user_login.email)
+    db_conn = db_connection_pool.getconn()
+    user = User.get_user(db_conn=db_conn, user_email=user_login.email)
+    db_connection_pool.putconn(db_conn)
 
     # user doesn't exist
     if not user:
@@ -305,7 +258,9 @@ def login(user_login: UserLogin, response: Response, request: Request):
 
 @app.post("/api/v1/register")
 def register(user_register: UserRegister, response: Response):
-    user = get_user(user_register.email)
+    db_conn = db_connection_pool.getconn()
+    user = User.get_user(db_conn=db_conn, user_email=user_register.email)
+    db_connection_pool.putconn(db_conn)
     if user:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
@@ -340,7 +295,9 @@ def upload_file(
         file: UploadFile,
         session_id: Annotated[str | None, Depends(login_required)]
 ):
-    user = get_user_by_session(session_id)
+    db_conn = db_connection_pool.getconn()
+    user = User.get_user_by_session(db_conn=db_conn, session_id=session_id)
+    db_connection_pool.putconn(db_conn)
 
     # sanitise the client provided path
     sanitised_path_from_base = helpers.sanitise_file_path(path_from_base)
@@ -383,7 +340,10 @@ def get_sig_file(file_path: str, session_id: Annotated[str | None, Depends(login
     The client can then use the signature file to compute a delta file and
     send a request to the server to update the file.
     """
-    user = get_user_by_session(session_id)
+    db_conn = db_connection_pool.getconn()
+    user = User.get_user_by_session(db_conn=db_conn, session_id=session_id)
+    db_connection_pool.putconn(db_conn)
+
     if not file_exists(user_id=user.user_id, file_path=file_path):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -430,7 +390,9 @@ def patch_file(
     The file to be updated is identified by the file_path, which is
     relative path from base dir + filename.
     """
-    user = get_user_by_session(session_id=session_id)
+    db_conn = db_connection_pool.getconn()
+    user = User.get_user_by_session(db_conn=db_conn, session_id=session_id)
+    db_connection_pool.putconn(db_conn)
     # check if the file exists
     if not file_exists(user_id=user.user_id, file_path=file_path):
         raise HTTPException(
@@ -518,7 +480,10 @@ def get_delta_file(
     the file to be updated on the client machine. Thus, the server and client
     now have the same version of the file.
     """
-    user = get_user_by_session(session_id=session_id)
+    db_conn = db_connection_pool.getconn()
+    user = User.get_user_by_session(db_conn=db_conn, session_id=session_id)
+    db_connection_pool.putconn(db_conn)
+
     if not file_exists(user_id=user.user_id, file_path=file_path):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
