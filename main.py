@@ -1,15 +1,13 @@
-from itsdangerous import URLSafeSerializer, SignatureExpired, BadSignature
+from itsdangerous import SignatureExpired, BadSignature
 from fastapi import FastAPI, HTTPException, status, Form, UploadFile
 from fastapi import BackgroundTasks, Depends, Request, Response
 from psycopg2.extras import DictCursor, register_uuid
 from fastapi.responses import FileResponse
 from contextlib import asynccontextmanager
-from globals import USERSPACES
+from globals import USERSPACES, serializer
 from pydantic import BaseModel
 from dotenv import load_dotenv
-from secrets import token_hex
 from typing import Annotated
-from typing import Optional
 from models.user import User
 from models.session import Session
 import hashlib
@@ -27,9 +25,6 @@ import secrets
 
 dbParameters = {}
 register_uuid()
-
-SECRET_KEY = token_hex()
-serializer = URLSafeSerializer(SECRET_KEY)
 
 db_connection_pool = None
 
@@ -67,17 +62,6 @@ class UserRegister(BaseModel):
     email: str
     password: str
     username: str
-
-
-def extract_cookie(signed_cookie) -> Optional[str]:
-    """
-    Returns the cookie if it's valid. Else returns None.
-    """
-    try:
-        cookie = serializer.loads(signed_cookie)
-        return cookie
-    except Exception:
-        return None
 
 
 def login_required(request: Request):
@@ -130,24 +114,6 @@ def login_required(request: Request):
         db_connection_pool.putconn(connection)
 
 
-def file_exists(user_id: str, file_path: str) -> bool:
-    """
-    This function checks if a file exists in the userspace
-    of a user.
-    Returns True if the file exists and False otherwise.
-    Note: The file_path argument must be a relative path
-    from the USERSPACE directory. The file_path doesn't need
-    to be sanitised.
-    """
-    sanitised_path = helpers.sanitise_file_path(file_path)
-    userspace = hashlib.sha256(user_id.encode()).hexdigest()
-
-    # check if the file exists
-    if not os.path.exists(os.path.join(USERSPACES, userspace, sanitised_path)):
-        return False
-    return True
-
-
 @app.post("/api/v1/login")
 def login(user_login: UserLogin, response: Response, request: Request):
     db_conn = db_connection_pool.getconn()
@@ -161,7 +127,7 @@ def login(user_login: UserLogin, response: Response, request: Request):
         )
     else:
         session_cookie = request.cookies.get("session-id")
-        session_id = extract_cookie(session_cookie)
+        session_id = helpers.extract_cookie(session_cookie)
         # If the session cookie is valid, check if the user already has an
         # active session against this session_id
         if session_id:
@@ -294,7 +260,7 @@ def get_sig_file(file_path: str, session_id: Annotated[str | None, Depends(login
     user = User.get_user_by_session(db_conn=db_conn, session_id=session_id)
     db_connection_pool.putconn(db_conn)
 
-    if not file_exists(user_id=user.user_id, file_path=file_path):
+    if not helpers.file_exists(user_id=user.user_id, file_path=file_path):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="File with specified path not found"
@@ -344,7 +310,7 @@ def patch_file(
     user = User.get_user_by_session(db_conn=db_conn, session_id=session_id)
     db_connection_pool.putconn(db_conn)
     # check if the file exists
-    if not file_exists(user_id=user.user_id, file_path=file_path):
+    if not helpers.file_exists(user_id=user.user_id, file_path=file_path):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="File with specified path not found"
@@ -434,7 +400,7 @@ def get_delta_file(
     user = User.get_user_by_session(db_conn=db_conn, session_id=session_id)
     db_connection_pool.putconn(db_conn)
 
-    if not file_exists(user_id=user.user_id, file_path=file_path):
+    if not helpers.file_exists(user_id=user.user_id, file_path=file_path):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="File with specified path not found"
