@@ -163,3 +163,4 @@ user-spaces/
 *.json
 *.txt
 .idea/
+.dockerignore
