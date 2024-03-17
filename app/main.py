@@ -17,16 +17,18 @@ import helpers
 import rdiff
 import tempfile
 import psycopg2
-import bcrypt
 import uuid
 import datetime
 import psycopg2.pool
 import secrets
+from argon2 import PasswordHasher
+from argon2.exceptions import VerificationError, VerifyMismatchError, InvalidHashError
 
 dbParameters = {}
 register_uuid()
 
 db_connection_pool = None
+ph = PasswordHasher()
 
 
 @asynccontextmanager
@@ -138,16 +140,24 @@ def login(user_login: UserLogin, response: Response, request: Request):
                     "email": user.email
                 }
 
-        # validate the password
-        password_valid = bcrypt.checkpw(
-            user_login.password.encode(),
-            user.password.encode()
-        )
-        if not password_valid:
+        try:
+            # validate the password
+            ph.verify(hash=user.password, password=user_login.password)
+        # password validation failed
+        except (VerifyMismatchError, VerificationError, InvalidHashError):
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="email or password is incorrect"
             )
+        # password_valid = bcrypt.checkpw(
+        #     user_login.password.encode(),
+        #     user.password.encode()
+        # )
+        # if not password_valid:
+        #     raise HTTPException(
+        #         status_code=status.HTTP_401_UNAUTHORIZED,
+        #         detail="email or password is incorrect"
+        #     )
         # create a session for the user
         session_id = secrets.token_hex(nbytes=32)
         signed_session_id = serializer.dumps(str(session_id))
@@ -185,7 +195,8 @@ def register(user_register: UserRegister, response: Response):
     # create the user
     else:
         db_conn = db_connection_pool.getconn()
-        hashed_password = bcrypt.hashpw(user_register.password.encode(), bcrypt.gensalt())
+        hashed_password = ph.hash(password=user_register.password)
+        # hashed_password = bcrypt.hashpw(user_register.password.encode(), bcrypt.gensalt())
         user = User.insert_user_to_db(
             user_id=uuid.uuid4(), username=user_register.username, email=user_register.email,
             hashed_password=hashed_password, db_conn=db_conn
