@@ -4,10 +4,10 @@ import os
 from secrets import token_hex
 from itsdangerous import URLSafeSerializer
 
-DIR_CONFIG_PATH = os.path.join(".", "dir-config.json")
+DIR_CONFIG_PATH = os.path.join(".", "config.json")
 
 if not os.path.exists(DIR_CONFIG_PATH):
-    print(f"dir-config.json not found. Exiting the program")
+    print(f"config.json not found. Exiting the program")
     sys.exit()
 
 with open(DIR_CONFIG_PATH, "r") as file:
