@@ -6,7 +6,6 @@ from fastapi.responses import FileResponse
 from contextlib import asynccontextmanager
 from globals import USERSPACES, serializer
 from pydantic import BaseModel
-from dotenv import load_dotenv
 from typing import Annotated
 from models.user import User
 from models.session import Session
@@ -35,7 +34,6 @@ ph = PasswordHasher()
 async def lifespan(app: FastAPI):
     global dbParameters
     global db_connection_pool
-    load_dotenv(dotenv_path=".env")
     dbParameters["database"] = os.environ["DB_NAME"]
     dbParameters["user"] = os.environ["DB_USER"]
     dbParameters["password"] = os.environ["DB_PASSWORD"]
