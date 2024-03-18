@@ -149,15 +149,6 @@ def login(user_login: UserLogin, response: Response, request: Request):
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="email or password is incorrect"
             )
-        # password_valid = bcrypt.checkpw(
-        #     user_login.password.encode(),
-        #     user.password.encode()
-        # )
-        # if not password_valid:
-        #     raise HTTPException(
-        #         status_code=status.HTTP_401_UNAUTHORIZED,
-        #         detail="email or password is incorrect"
-        #     )
         # create a session for the user
         session_id = secrets.token_hex(nbytes=32)
         signed_session_id = serializer.dumps(str(session_id))
@@ -196,7 +187,6 @@ def register(user_register: UserRegister, response: Response):
     else:
         db_conn = db_connection_pool.getconn()
         hashed_password = ph.hash(password=user_register.password)
-        # hashed_password = bcrypt.hashpw(user_register.password.encode(), bcrypt.gensalt())
         user = User.insert_user_to_db(
             user_id=uuid.uuid4(), username=user_register.username, email=user_register.email,
             hashed_password=hashed_password, db_conn=db_conn
