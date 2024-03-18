@@ -4,16 +4,10 @@ import os
 from secrets import token_hex
 from itsdangerous import URLSafeSerializer
 
-DIR_CONFIG_PATH = os.path.join(".", "config.json")
+USERSPACES = os.environ.get('USERSPACES')
 
-if not os.path.exists(DIR_CONFIG_PATH):
-    print(f"config.json not found. Exiting the program")
-    sys.exit()
-
-with open(DIR_CONFIG_PATH, "r") as file:
-    dir_config = json.load(file)
-
-USERSPACES = os.path.normpath(dir_config["user-spaces"])
+if not USERSPACES:
+    raise Exception("USERSPACES environment variable not found.")
 
 SECRET_KEY = token_hex()
 serializer = URLSafeSerializer(SECRET_KEY)
