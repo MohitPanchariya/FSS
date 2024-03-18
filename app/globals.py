@@ -1,5 +1,3 @@
-import json
-import sys
 import os
 from secrets import token_hex
 from itsdangerous import URLSafeSerializer
