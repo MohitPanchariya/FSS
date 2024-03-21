@@ -157,14 +157,14 @@ def create_reverse_delta(
     # create a temporary signature file
     temp_sig_file = tempfile.NamedTemporaryFile(mode="wb", delete=False)
     create_sig_file(
-        basis_file_path=file_path,
+        basis_file_path=updated_file_path,
         sig_file_path=temp_sig_file.name
     )
     # create a delta file that will store the instruction to revert
     # the file located at updated_file_path to the file located at
     # file_path
     create_delta_file(
-        file_path=updated_file_path, sig_file_path=temp_sig_file.name,
+        file_path=file_path, sig_file_path=temp_sig_file.name,
         delta_file_path=reverse_delta_path
     )
 
