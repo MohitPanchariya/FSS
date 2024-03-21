@@ -114,6 +114,117 @@ def login_required(request: Request):
         db_connection_pool.putconn(connection)
 
 
+def create_sig_file(basis_file_path: str, sig_file_path: str):
+    """
+    This function creates a signature file, and saves it to
+    sig_file_path.
+    """
+    checksum = rdiff.signature.Checksum()
+    signature = rdiff.signature.Signature(checksum)
+    signature.createSignature(
+        basisFilePath=basis_file_path,
+        sigFilePath=sig_file_path
+    )
+
+
+def create_delta_file(file_path: str, sig_file_path: str, delta_file_path: str):
+    """
+    This function creates a delta file for the file located at file_path,
+    against the signature file located at sig_file_path. The delta file is
+    stored at delta_file_path
+    """
+    checksum = rdiff.signature.Checksum()
+    delta = rdiff.delta.Delta()
+    delta.createDeltaFile(
+        inFilePath=file_path,
+        deltaFilePath=delta_file_path,
+        sigFielPath=sig_file_path,
+        blockSize=1024,  # default block size used to create the sig file
+        checksum=checksum
+    )
+
+
+def create_reverse_delta(
+        file_path: str, updated_file_path: str,
+        reverse_delta_path: str
+):
+    """
+    Create a delta file that can be used to revert an updated file,
+    back to the original file.
+    Here, update_file_path is the path to the updated file and file_path
+    is the path to the original file.
+    """
+    # create a temporary signature file
+    temp_sig_file = tempfile.NamedTemporaryFile(mode="wb", delete=False)
+    create_sig_file(
+        basis_file_path=file_path,
+        sig_file_path=temp_sig_file.name
+    )
+    # create a delta file that will store the instruction to revert
+    # the file located at updated_file_path to the file located at
+    # file_path
+    create_delta_file(
+        file_path=updated_file_path, sig_file_path=temp_sig_file.name,
+        delta_file_path=reverse_delta_path
+    )
+
+    temp_sig_file.close()
+    # delete the temp signature file
+    os.remove(temp_sig_file.name)
+
+
+def store_reverse_delta(
+        file_path: str, updated_file_path: str,
+        delta_dir_path: str,
+):
+    """
+    Store a reverse delta file at the delta_dir_path, with a
+    unique filename(uuid). Returns the path where the reverse
+    delta file is stored.
+    """
+    reverse_delta_id = uuid.uuid4().hex
+    # the head file stores the id's of all reverse delta's
+    head_file = os.path.split(file_path)[1] + ".head"
+
+    if not os.path.exists(delta_dir_path):
+        os.makedirs(delta_dir_path)
+
+    if not os.path.exists(os.path.join(delta_dir_path, head_file)):
+        # create a file which will store the id's of different reverse delta's
+        with open(os.path.join(delta_dir_path, head_file), "w"):
+            pass
+    # append the latest reverse delta's id to the head file
+    with open(os.path.join(delta_dir_path, head_file), "a") as out:
+        # parent_meta_id = out.readline()
+        out.write(f"{reverse_delta_id}\n")
+
+    reverse_delta = open(file=os.path.join(delta_dir_path, reverse_delta_id), mode="wb")
+    create_reverse_delta(
+        file_path=file_path, updated_file_path=updated_file_path,
+        reverse_delta_path=reverse_delta.name
+    )
+    reverse_delta.close()
+    return reverse_delta.name
+
+
+def reverse_delta_ids(file_path: str):
+    """
+    Returns the list of all reverse delta id's for a
+    given file. If there are no reverse delta's, returns an
+    empty list
+    """
+    head_file = os.path.join(
+        os.path.split(file_path)[0], "delta", (os.path.split(file_path)[1] + ".head")
+    )
+    ids = []
+    if os.path.exists(head_file):
+        with open(os.path.join(head_file), "r") as head:
+            for reverse_delta_id in head:
+                ids.append(reverse_delta_id.strip())
+
+    return ids
+
+
 @app.post("/api/v1/login")
 def login(user_login: UserLogin, response: Response, request: Request):
     db_conn = db_connection_pool.getconn()
@@ -276,11 +387,9 @@ def get_sig_file(file_path: str, session_id: Annotated[str | None, Depends(login
     os.makedirs(os.path.join(USERSPACES, userspace, base_path, ".signatures"), exist_ok=True)
 
     # create the signature file for the requested file and store it in the signatures directory
-    checksum = rdiff.signature.Checksum()
-    signature = rdiff.signature.Signature(checksum)
-    signature.createSignature(
-        basisFilePath=os.path.join(USERSPACES, userspace, sanitised_path),
-        sigFilePath=os.path.join(USERSPACES, userspace, base_path, ".signatures", filename)
+    create_sig_file(
+        basis_file_path=os.path.join(USERSPACES, userspace, sanitised_path),
+        sig_file_path=os.path.join(USERSPACES, userspace, base_path, ".signatures", filename)
     )
 
     return FileResponse(
@@ -349,8 +458,13 @@ def patch_file(
 
         temp_out_file.close()
 
+        file_path = os.path.join(USERSPACES, userspace, sanitised_path)
+        delta_dir_path = os.path.join(USERSPACES, userspace, base_path, "delta")
+        # store a reverse delta file
+        store_reverse_delta(file_path=file_path, delta_dir_path=delta_dir_path, updated_file_path=temp_out_file.name)
+
         # Atomically rename the temporary file to the actual filename
-        os.replace(temp_out_file.name, os.path.join(USERSPACES, userspace, sanitised_path))
+        os.replace(temp_out_file.name, file_path)
     except Exception:
         # remove the temp updated file
         if temp_out_file:
@@ -429,14 +543,10 @@ def get_delta_file(
 
     # Populate the delta file
     try:
-        checksum = rdiff.signature.Checksum()
-        delta = rdiff.delta.Delta()
-        delta.createDeltaFile(
-            inFilePath=os.path.join(USERSPACES, userspace, sanitised_path),
-            deltaFilePath=temp_delta_file.name,
-            sigFielPath=temp_sig_file.name,
-            blockSize=1024,  # default block size used to create the sig file
-            checksum=checksum
+        create_delta_file(
+            file_path=os.path.join(USERSPACES, userspace, sanitised_path),
+            delta_file_path=temp_delta_file.name,
+            sig_file_path=temp_sig_file.name
         )
     except Exception:
         raise HTTPException(
@@ -453,5 +563,72 @@ def get_delta_file(
     return FileResponse(
         os.path.join(USERSPACES, userspace, base_path, temp_delta_file.name),
         filename=f"{filename}.delta",
+        media_type="application/octet-stream"
+    )
+
+
+@app.get("/api/v1/reverse_delta_ids/{file_path: path}")
+def get_reverse_delta_ids(file_path: str, session_id: Annotated[str | None, Depends(login_required)]):
+    """
+    Endpoint used to fetch a list of reverse delta ids for a given file in a userspace.
+    This endpoint acts as an auxiliary endpoint for reverting a file back to a
+    particular version.
+    """
+    db_conn = db_connection_pool.getconn()
+    user = User.get_user_by_session(db_conn=db_conn, session_id=session_id)
+    db_connection_pool.putconn(db_conn)
+
+    if not helpers.file_exists(user_id=user.user_id, file_path=file_path):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="File with specified path not found"
+        )
+
+    sanitised_path = helpers.sanitise_file_path(file_path)
+
+    userspace = hashlib.sha256(user.user_id.encode()).hexdigest()
+
+    ids = reverse_delta_ids(os.path.join(USERSPACES, userspace, sanitised_path))
+
+    return {
+        "reverse_delta_ids": ids
+    }
+
+
+@app.get("/api/v1/download/reverse_delta/{file_path: str}/{reverse_delta_id: str}")
+def download_reverse_delta(
+        file_path: str, reverse_delta_id: str,
+        session_id: Annotated[str | None, Depends(login_required)]
+):
+    """
+    Endpoint to download the reverse delta for a given file and reverse delta id
+    """
+    db_conn = db_connection_pool.getconn()
+    user = User.get_user_by_session(db_conn=db_conn, session_id=session_id)
+    db_connection_pool.putconn(db_conn)
+
+    if not helpers.file_exists(user_id=user.user_id, file_path=file_path):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="File with specified path not found"
+        )
+
+    sanitised_path = helpers.sanitise_file_path(file_path)
+
+    userspace = hashlib.sha256(user.user_id.encode()).hexdigest()
+
+    reverse_delta_path = os.path.join(
+        USERSPACES, userspace, os.path.split(sanitised_path)[0], "delta", reverse_delta_id
+    )
+
+    if not os.path.exists(reverse_delta_path):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="reverse delta with specified id not found"
+        )
+
+    return FileResponse(
+        reverse_delta_path,
+        filename=reverse_delta_id,
         media_type="application/octet-stream"
     )
