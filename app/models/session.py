@@ -34,7 +34,7 @@ class Session:
         db_conn.commit()
 
     @staticmethod
-    def delete_expired_session(db_conn, session_id: str):
+    def delete_session(db_conn, session_id: str):
         """
         Deletes the session with the given session_id from
         the database.
@@ -61,7 +61,7 @@ class Session:
         if session_data:
             # session has expired
             if session_data["expires_at"] < datetime.datetime.now():
-                Session.delete_expired_session(db_conn=db_conn, session_id=session_id)
+                Session.delete_session(db_conn=db_conn, session_id=session_id)
                 return False
             # session is still active
             else:
