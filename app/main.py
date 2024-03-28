@@ -649,3 +649,16 @@ def download_reverse_delta(
         filename=reverse_delta_id,
         media_type="application/octet-stream"
     )
+
+
+@app.get("/api/v1/download/userspace")
+def download_userspace(session_id: Annotated[str | None, Depends(login_required)], background_task: BackgroundTasks):
+    db_conn = db_connection_pool.getconn()
+    user = User.get_user_by_session(db_conn=db_conn, session_id=session_id)
+    db_connection_pool.putconn(db_conn)
+    userspace = hashlib.sha256(user.user_id.encode()).hexdigest()
+    userspace_path = os.path.join(USERSPACES, userspace)
+    shutil.make_archive(userspace_path, "zip", userspace_path)
+    # after the server responds with the zip file, delete it
+    background_task.add_task(delete_temp_delta_file, userspace_path + ".zip")
+    return FileResponse(userspace_path + ".zip", media_type="application/octet-stream", filename="userspace.zip")
