@@ -91,7 +91,7 @@ def login_required(request: Request):
         if result:
             # session has expired
             if result["expires_at"] < datetime.datetime.now():
-                Session.delete_expired_session(db_conn=connection, session_id=session_id)
+                Session.delete_session(db_conn=connection, session_id=session_id)
             # session is still valid
             else:
                 return session_id
@@ -280,6 +280,23 @@ def login(user_login: UserLogin, response: Response, request: Request):
             "id": user.user_id,
             "email": user.email
         }
+
+
+@app.post("/api/v1/logout")
+def logout(request: Request, response: Response, logout_everywhere: bool | None = None):
+    session_id = helpers.extract_cookie(request.cookies.get("session-id"))
+    if not session_id:
+        return
+    db_conn = db_connection_pool.getconn()
+    if logout_everywhere:
+        user = User.get_user_by_session(db_conn=db_conn, session_id=session_id)
+        Session.delete_all_sessions(db_conn=db_conn, user_id=user.user_id)
+    else:
+        Session.delete_session(db_conn=db_conn, session_id=session_id)
+    db_connection_pool.putconn(db_conn)
+
+    response.delete_cookie(key="session-id")
+    return
 
 
 @app.post("/api/v1/register")
