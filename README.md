@@ -36,7 +36,7 @@ A file synchronisation service to keep a directory in sync across multiple devic
    <br><br>
    
 4. The services should be up and the api endpoints can now be accessed at "localhost/docs"
-   ![Openapi spec](./setup_instructions/openapi.png)
+   ![Openapi specification](./setup_instructions/openapi.png)
    <br><br>
 
 ## Possible issue with postgres
