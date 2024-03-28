@@ -46,6 +46,17 @@ class Session:
         db_conn.commit()
 
     @staticmethod
+    def delete_all_sessions(db_conn, user_id: str):
+        """
+        Deletes all sessions for a user identified by the given user_id.
+        """
+        query = "DELETE FROM user_session WHERE user_id = %s"
+        cursor = db_conn.cursor()
+        cursor.execute(query, (user_id,))
+        cursor.close()
+        db_conn.commit()
+
+    @staticmethod
     def is_session_active(db_conn, session_id: str) -> bool:
         """
         Returns True if the session is active and False otherwise.
